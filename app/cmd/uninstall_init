@@ -1,0 +1,6 @@
+#!/bin/bash
+set -u
+APP_HOME="$(dirname "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)")"
+# 卸载前停掉守护进程，避免遗留孤儿
+[ -x "$APP_HOME/cmd/main" ] && "$APP_HOME/cmd/main" stop >/dev/null 2>&1
+exit 0

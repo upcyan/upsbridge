@@ -1,0 +1,83 @@
+#!/bin/bash
+# upsbridge —— fnOS 应用生命周期入口
+# 由 fnOS 以 root 调用：cmd/main start|stop|status|restart|log
+#
+# 安装后布局：
+#   /var/apps/upsbridge/cmd/main        本脚本
+#   /var/apps/upsbridge/target/         <- app.tgz 解压到此
+#   /var/apps/upsbridge/target/upsbridge/upsbridge.py
+#   /var/apps/upsbridge/target/ui/      桌面入口
+#   /vol1/@appdata/upsbridge/           -> var/
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+APP_HOME="$(dirname "$SCRIPT_DIR")"
+
+PY=""
+for c in /usr/bin/python3 /var/apps/python312/target/bin/python3 python3; do
+  if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+done
+[ -n "$PY" ] || { echo "找不到 python3" >&2; exit 1; }
+
+VAR="$APP_HOME/var"; RUN="$VAR/run"; LOG="$VAR/log"; ETC="$APP_HOME/etc"
+mkdir -p "$RUN" "$LOG" "$ETC"
+
+PIDFILE="$RUN/app.pid"
+PORT="${UPSBRIDGE_PORT:-28190}"
+APP="$APP_HOME/target/upsbridge/upsbridge.py"
+CONF="$ETC/config.json"
+
+log() { printf "[upsbridge] %s\n" "$*"; }
+
+is_running() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid; pid="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 1
+  return 0
+}
+
+do_start() {
+  if is_running; then log "已在运行 (pid $(cat "$PIDFILE"))"; return 0; fi
+  if [ ! -f "$APP" ]; then log "找不到主程序 $APP"; return 1; fi
+  [ -f "$CONF" ] || cp "$APP_HOME/target/upsbridge/config.default.json" "$CONF"
+  nohup "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" \
+      >> "$LOG/stdout.log" 2>&1 &
+  echo $! > "$PIDFILE"
+  local i=0
+  while [ $i -lt 10 ]; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+      exec 3>&- 3<&-; log "已启动 (pid $(cat "$PIDFILE"), :$PORT)"; return 0
+    fi
+    sleep 1; i=$((i+1))
+  done
+  log "启动超时，最近日志："; tail -n 20 "$LOG/app.log" 2>/dev/null
+  return 1
+}
+
+do_stop() {
+  if ! is_running; then rm -f "$PIDFILE"; log "未运行"; return 0; fi
+  local pid; pid="$(cat "$PIDFILE")"
+  kill "$pid" 2>/dev/null
+  local i=0
+  while [ $i -lt 10 ] && [ -d "/proc/$pid" ]; do sleep 1; i=$((i+1)); done
+  [ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null
+  rm -f "$PIDFILE"
+  log "已停止"
+}
+
+do_status() {
+  if is_running; then echo "running"; exit 0; fi
+  if curl -sf -m 2 "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+    echo "running"; exit 0
+  fi
+  echo "stopped"; exit 3
+}
+
+case "${1:-}" in
+  start)   do_start ;;
+  stop)    do_stop ;;
+  restart) do_stop; do_start ;;
+  status)  do_status ;;
+  log)     tail -n "${2:-100}" "$LOG/app.log" ;;
+  *)       echo "usage: $0 start|stop|restart|status|log" >&2; exit 1 ;;
+esac

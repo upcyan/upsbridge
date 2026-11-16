@@ -1,0 +1,5 @@
+#!/bin/bash
+set -u
+APP_HOME="$(dirname "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)")"
+[ -x "$APP_HOME/cmd/main" ] && "$APP_HOME/cmd/main" stop >/dev/null 2>&1
+exit 0

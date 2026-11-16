@@ -1,0 +1,14 @@
+# 构建产物
+dist/
+app/app.tgz
+app/target/ui/
+
+# 运行时
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store

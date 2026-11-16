@@ -1,0 +1,5 @@
+#!/bin/bash
+set -u
+# 安装前：只做环境检查，不改系统
+echo "[upsbridge] install_init"
+exit 0

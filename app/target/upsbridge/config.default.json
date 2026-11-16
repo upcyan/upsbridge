@@ -1,0 +1,23 @@
+{
+  "upstream": {
+    "host": "",
+    "port": 3493,
+    "upsname": "",
+    "username": "",
+    "password": ""
+  },
+  "rules": {
+    "dry_run": true,
+    "shutdown_on_battery_seconds": 300,
+    "shutdown_on_lowbattery": true,
+    "shutdown_on_fsd": true,
+    "battery_charge_low_override": 0,
+    "deadtime": 30,
+    "poll_interval": 5,
+    "shutdown_cmd": "/sbin/shutdown -h +0",
+    "fsd_grace_seconds": 15
+  },
+  "notify": {
+    "wall": true
+  }
+}
