@@ -104,9 +104,24 @@ do_start() {
   rm -f "$PIDFILE"
   if [ ! -f "$APP" ]; then log "找不到主程序 $APP"; return 1; fi
   [ -f "$CONF" ] || cp "$APP_HOME/target/upsbridge/config.default.json" "$CONF"
-  nohup "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" \
-      >> "$LOG/stdout.log" 2>&1 &
+  # setsid：把服务放进独立会话/进程组。
+  # ⚠️ 实测 1.0.1 装好后 19 秒进程凭空消失、事件日志记 APP_CRASH，app.log 里既没有
+  # 异常也没有退出记录（stdout.log 一个字节没写）—— 那是被信号杀掉的典型特征：
+  # 应用中心拉起应用后按进程组回收，nohup 只挡 SIGHUP、挡不住整组 SIGTERM。
+  # setsid 之后本进程组不再等于调用方，收不到这种连带信号。
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" \
+        < /dev/null >> "$LOG/stdout.log" 2>&1 &
+  else
+    nohup "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" \
+        < /dev/null >> "$LOG/stdout.log" 2>&1 &
+  fi
   local pid=$!
+  disown 2>/dev/null || true
+  # setsid 有时会 fork 一次，$! 未必是真身；以命令行反查实际 pid，取最新一个
+  local real
+  real="$(pgrep -n -f "$APP" 2>/dev/null || true)"
+  [ -n "$real" ] && pid="$real"
   echo "$pid" > "$PIDFILE"
   local i=0
   while [ $i -lt 15 ]; do
