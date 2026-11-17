@@ -1,3 +1,40 @@
+## upsbridge 1.0.1
+
+修复一个会让断电保护**静默失效**的缺陷。
+
+### 修了什么
+
+**残留 pidfile 挡住启动。** 上一版 `cmd/main status` 只判 `/proc/$pid` 是否存在。系统重启后 pid 会被别的进程复用，残留的 pidfile 于是指向一个完全无关的程序（本机实测指向 `trim-preview-server`）。后果是应用中心开机拉起时，`cmd/main start` 认为「已在运行」直接返回 0，实际进程根本没起来 —— 而日志里只有一行 `already running`，看起来一切正常。
+
+现在 `is_running()` 会核对 `/proc/$pid/cmdline` 里确实有 `upsbridge.py`，归属不符就删掉脏 pidfile 重来；`start` 也改成先探活再写 pidfile，启动失败不留脏文件。
+
+```
+# 事故现场
+/var/log/trim_app_center/info.log:
+08:22:43 msg="already running" appName=upsbridge class=start code=0   # 实际没拉起
+```
+
+**`OB` / `LB` 改成 token 精确匹配。** 原来用子串判断，`OL RB` 这种组合状态里含 `RB` 不含 `OB` 尚可，但 `OB DISCHRG` / `LB DISCHRG` 之外再多一个词就可能误命中。现在统一 `set(status.split())` 比较。
+
+### 加了什么
+
+**`ups.status` 变化写入日志。** 只记变化不记每次轮询，并忽略 `CHRG` 抖动 —— APC Back-UPS 接市电时 `OL` 与 `OL CHRG` 会反复跳（本机 60 秒内切了 26 次），把这种抖动也记下来会刷满日志、淹没真正要复盘的 `OB` / `LB` / `OVER`。
+
+**`RB` 只记录不关机。** 上游报 RB 时写一行「建议更换电池」，不参与任何关机判定。
+
+```
+UPS 状态：OL CHRG
+UPS 状态变化：OL → OL RB
+上游报告 RB（建议更换电池）：本机不据此关机，仅记录
+UPS 状态变化：OL RB → OB DISCHRG
+检测到市电中断，开始计时（阈值 300s）
+```
+
+### 升级
+
+应用中心手动安装 `upsbridge_1.0.1.fpk` 覆盖即可，配置（`/vol1/@appconf/upsbridge/config.json`）保留。
+
+装完看一眼状态卡是不是「运行中」，再确认日志里有新的一行 `UPS 状态：...` —— 这行是新版本才有的。
 ## upsbridge 1.0.0
 
 飞牛 fnOS 应用：接入局域网内**任意** NUT Server，市电中断后按规则让本机自动关机。

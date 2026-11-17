@@ -7,7 +7,7 @@
 import argparse, json, os, socket, sys, threading, time, subprocess, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 DEFAULT_CONFIG = {
     # 上游地址留空：首次使用必须由用户在界面里填写，仓库里不写死任何 IP / 账号 / 密码。
@@ -145,6 +145,33 @@ class NutClient:
         return variables, fsd
 
 
+# ups.status 里只表示"正在充电"的标记。APC Back-UPS 接市电时会 OL <-> OL CHRG
+# 反复跳（实测 60 秒内切换 26 次），若把这种抖动也记一行，日志会被刷满，
+# 真正需要复盘的 RB / OB / LB / OVER 反而被淹没。所以变化检测忽略 CHRG，
+# 但记录下来的原始状态仍然完整。
+CHATTER_TOKENS = {"CHRG"}
+
+
+def status_signature(status):
+    return " ".join(sorted(t for t in status.split() if t not in CHATTER_TOKENS))
+
+
+def note_status_change(status, st, log):
+    """只在 ups.status 发生「有意义」变化时记一行。"""
+    sig = status_signature(status)
+    if sig == st.get("status_sig"):
+        return
+    old = st.get("status_sig")
+    st["status_sig"] = sig
+    if old is None:
+        log.add("UPS 状态：" + (status or "(空)"))
+    else:
+        log.add("UPS 状态变化：" + (old or "(空)") + " → " + (status or "(空)"))
+    if "RB" in status.split() and not st.get("rb_warned"):
+        st["rb_warned"] = True
+        log.add("上游报告 RB（建议更换电池）：本机不据此关机，仅记录")
+
+
 class Monitor(threading.Thread):
     def __init__(self, ctx):
         super().__init__(daemon=True)
@@ -182,7 +209,9 @@ class Monitor(threading.Thread):
     def update_state(self, v, fsd, cfg, st, log):
         rules = cfg["rules"]
         status = v.get("ups.status", "").upper()
-        if "FSD" in status.split():
+        tokens = set(status.split())
+        note_status_change(status, st, log)
+        if "FSD" in tokens:
             fsd = True
         charge = None
         try:
@@ -201,8 +230,9 @@ class Monitor(threading.Thread):
         }
         st["last_poll"] = now
 
-        on_batt = ("OB" in status) or ("OB DISCHRG" in status)
-        lb = "LB" in status
+        # token 精确匹配：子串匹配会被 "OL RB" 之类的组合状态误命中
+        on_batt = "OB" in tokens
+        lb = "LB" in tokens
         if low_override > 0 and charge is not None and charge <= low_override:
             lb = True
 

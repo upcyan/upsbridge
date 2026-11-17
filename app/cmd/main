@@ -10,6 +10,9 @@
 #   /vol1/@appdata/upsbridge/           -> var/
 set -u
 
+# fnOS 调用生命周期脚本时不保证 PATH（见 CyanNVR 踩坑注释），显式补上
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 APP_HOME="$(dirname "$SCRIPT_DIR")"
 
@@ -29,47 +32,120 @@ CONF="$ETC/config.json"
 
 log() { printf "[upsbridge] %s\n" "$*"; }
 
-is_running() {
-  [ -f "$PIDFILE" ] || return 1
-  local pid; pid="$(cat "$PIDFILE" 2>/dev/null)"
-  [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 1
+# 端口探活：不依赖 curl，/dev/tcp 是 bash 内建的
+port_open() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null || return 1
+  exec 3>&- 3<&-
   return 0
 }
 
+pid_from_file() {
+  [ -f "$PIDFILE" ] || return 1
+  local p; p="$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null)"
+  [ -n "$p" ] || return 1
+  printf '%s' "$p"
+}
+
+# 判定「本应用真的在跑」。
+# ⚠️ 只判断 /proc/<pid> 是否存在是不够的：pid 会被系统复用。实测重启后 pidfile 里
+# 的 6088 被 trim-preview-server 顶替，status 于是永远谎报 running，应用中心认为
+# 服务健在、从不重拉，桌面打开时后端不可达 -> 显示「FN Connect 暂无权限访问该服务」。
+# 因此必须确认该 pid 的命令行确实是 upsbridge.py。
+is_running() {
+  local pid; pid="$(pid_from_file)" || return 1
+  [ -d "/proc/$pid" ] || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "upsbridge.py"
+}
+
+# 开机/安装自愈：应用中心拉起失败时的兜底单元。
+# 为什么放在这里而不是只放 install_callback：实测 1.0.1 安装时应用中心并没有
+# 覆盖 cmd/install_callback（只有 main 与 upsbridge.py 被换掉），于是依赖它的
+# 兜底单元永远不会被创建。start 由应用中心以 root 调用，是最稳定的落点。
+# 只做「写单元 + enable」，绝不 --now：此刻 do_start 正跑到一半，--now 会递归。
+UNIT="/etc/systemd/system/upsbridge-fpk.service"
+ensure_unit() {
+  [ "$(id -u)" = "0" ] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local want
+  want="[Unit]
+Description=upsbridge fpk 应用（UPS 断电联动）
+# 应用中心开机也会按 DB 状态拉起应用；本单元是兜底：
+# 若走应用中心路径失败（例如 status 判定异常、批量启动被跳过），进程仍能起来。
+# 两边都启动时 start 幂等（端口探活 + pid 校验），不会重复拉。
+After=network-online.target trim_app_center.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/var/apps/upsbridge/cmd/main start
+ExecStop=/var/apps/upsbridge/cmd/main stop
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target"
+  if [ "$(cat "$UNIT" 2>/dev/null)" != "$want" ]; then
+    printf '%s\n' "$want" > "$UNIT" 2>/dev/null && systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  systemctl is-enabled upsbridge-fpk.service >/dev/null 2>&1 || systemctl enable upsbridge-fpk.service >/dev/null 2>&1 || true
+}
+
 do_start() {
-  if is_running; then log "已在运行 (pid $(cat "$PIDFILE"))"; return 0; fi
+  ensure_unit
+  if port_open; then
+    if is_running; then log "已在运行 (pid $(pid_from_file), :$PORT)"; else log "端口 :$PORT 已被其他进程占用"; fi
+    return 0
+  fi
+  if is_running; then
+    log "pid $(pid_from_file) 存活但 :$PORT 无响应，先清理"
+    do_stop
+  fi
+  rm -f "$PIDFILE"
   if [ ! -f "$APP" ]; then log "找不到主程序 $APP"; return 1; fi
   [ -f "$CONF" ] || cp "$APP_HOME/target/upsbridge/config.default.json" "$CONF"
   nohup "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" \
       >> "$LOG/stdout.log" 2>&1 &
-  echo $! > "$PIDFILE"
+  local pid=$!
+  echo "$pid" > "$PIDFILE"
   local i=0
-  while [ $i -lt 10 ]; do
-    if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
-      exec 3>&- 3<&-; log "已启动 (pid $(cat "$PIDFILE"), :$PORT)"; return 0
-    fi
+  while [ $i -lt 15 ]; do
+    if port_open; then log "已启动 (pid $pid, :$PORT)"; return 0; fi
+    [ -d "/proc/$pid" ] || break
     sleep 1; i=$((i+1))
   done
-  log "启动超时，最近日志："; tail -n 20 "$LOG/app.log" 2>/dev/null
+  log "启动失败，最近日志："; tail -n 20 "$LOG/app.log" 2>/dev/null
+  [ -d "/proc/$pid" ] || rm -f "$PIDFILE"
   return 1
 }
 
 do_stop() {
-  if ! is_running; then rm -f "$PIDFILE"; log "未运行"; return 0; fi
-  local pid; pid="$(cat "$PIDFILE")"
-  kill "$pid" 2>/dev/null
-  local i=0
-  while [ $i -lt 10 ] && [ -d "/proc/$pid" ]; do sleep 1; i=$((i+1)); done
-  [ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null
+  local pid; pid="$(pid_from_file)" || pid=""
+  if [ -n "$pid" ] && is_running; then
+    kill "$pid" 2>/dev/null
+    local i=0
+    while [ $i -lt 10 ] && [ -d "/proc/$pid" ]; do sleep 1; i=$((i+1)); done
+    [ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null
+  fi
+  # 兜底：pidfile 丢失/失效时按命令行清理残留进程，避免端口被占着起不来
+  pkill -f "$APP" 2>/dev/null
   rm -f "$PIDFILE"
   log "已停止"
 }
 
+# 状态以端口为准：pidfile 只是线索。
+# 只有端口真的在响应才算 running —— 宁可多报一次 stopped 让应用中心重拉，
+# 也不要谎报 running 导致服务永久不启动。
 do_status() {
-  if is_running; then echo "running"; exit 0; fi
-  if curl -sf -m 2 "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
-    echo "running"; exit 0
+  if port_open; then echo "running"; exit 0; fi
+  if is_running; then
+    local pid age
+    pid="$(pid_from_file)"
+    age=$(( $(date +%s) - $(stat -c %Y "$PIDFILE" 2>/dev/null || echo 0) ))
+    if [ "$age" -lt 20 ]; then echo "running"; exit 0; fi
+    log "pid $pid 存活但 :$PORT 无响应（pidfile 已 $age 秒），判定为异常并清理"
   fi
+  rm -f "$PIDFILE"
   echo "stopped"; exit 3
 }
 

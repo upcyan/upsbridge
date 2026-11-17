@@ -1,5 +1,5 @@
 appname               = upsbridge
-version               = 1.0.0
+version               = 1.0.1
 display_name          = UPS 断电联动
 desc                  = 接入局域网内任意 NUT Server（绿联 / 群晖 / 威联通 / 树莓派），市电中断后按规则自动关机。<br><br>不修改 /etc/nut，系统升级和应用开关都不会冲掉配置；默认演练模式，不会真的关机，验证通过后再打开。<br><br>支持：断电时长判定、低电量判定、上游强制关机（FSD）信号、通信中断不误触发。
 platform              = x86
@@ -14,4 +14,4 @@ checkport             = false
 ctl_stop              = true
 desktop_uidir         = ui
 desktop_applaunchname = upsbridge.main
-changelog             = v1.0.0<br>- 首个版本：NUT 协议客户端直连上游 upsd，不依赖也不改写 /etc/nut
+changelog             = v1.0.1<br>- 修复重启后服务不再自启：status 曾因 pid 复用谎报 running，应用中心因此从不重拉，桌面打开报「FN Connect 暂无权限访问该服务」，刷新后才好<br>- 新增 systemd 兜底单元 upsbridge-fpk.service，应用中心拉起失败时仍能在开机后启动<br>- 生命周期脚本显式补 PATH，权限位在安装回调里重新补齐<br>v1.0.0<br>- 首个版本：NUT 协议客户端直连上游 upsd，不依赖也不改写 /etc/nut

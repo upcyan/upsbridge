@@ -1,3 +1,17 @@
 #!/bin/bash
+# 升级后回调：单元内容随版本更新，重新 enable + 重启一次
 set -u
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+APP_HOME="$(dirname "$(dirname "$SELF")")"
+[ -d "$APP_HOME" ] || APP_HOME="/var/apps/upsbridge"
+
+if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+  if [ -x "$APP_HOME/cmd/install_callback" ]; then
+    "$APP_HOME/cmd/install_callback" >/dev/null 2>&1 || true
+  fi
+  systemctl restart upsbridge-fpk.service >/dev/null 2>&1 || true
+fi
+printf "[upsbridge] upgrade_callback 完成\n"
 exit 0

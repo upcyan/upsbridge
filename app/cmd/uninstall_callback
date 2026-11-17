@@ -1,3 +1,13 @@
 #!/bin/bash
+# 卸载后回调：撤掉开机自启兜底单元
 set -u
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+UNIT="/etc/systemd/system/upsbridge-fpk.service"
+if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+  systemctl disable --now upsbridge-fpk.service >/dev/null 2>&1 || true
+  rm -f "$UNIT"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+printf "[upsbridge] uninstall_callback 完成\n"
 exit 0

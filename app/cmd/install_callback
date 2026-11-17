@@ -1,4 +1,59 @@
 #!/bin/bash
+# 安装后回调（fnOS 以 root 执行）
+#
+# 这里刻意不写 appcenter 数据库：本应用是走应用中心安装的，app / app_service /
+# app_open 三张表由安装器写好了；再手工插一次反而会把 is_stop / status 改歪。
+# 缺的是「开机自启」这一环 —— 应用中心批量拉起失败或状态判定异常时，服务就再也不会起来。
 set -u
-echo "[upsbridge] install_callback"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+APP_HOME="$(dirname "$(dirname "$SELF")")"
+[ -d "$APP_HOME" ] || APP_HOME="/var/apps/upsbridge"
+APP_NAME="upsbridge"
+UNIT="/etc/systemd/system/${APP_NAME}-fpk.service"
+MARK="$APP_HOME/var/.install_callback.done"
+VER="$(awk -F= '/^version/{gsub(/[ \t]/,"",$2);print $2}' "$APP_HOME/manifest" 2>/dev/null || echo unknown)"
+
+log() { printf "[upsbridge] %s\n" "$*"; }
+
+# 1) 权限修正：打包/解包链路可能把可执行位拍平（kimicode 踩过同一个坑）
+chmod +x "$APP_HOME"/cmd/* 2>/dev/null || true
+chmod +x "$APP_HOME/target/upsbridge/upsbridge.py" 2>/dev/null || true
+
+# 2) 目录就绪
+mkdir -p "$APP_HOME/var/run" "$APP_HOME/var/log" "$APP_HOME/etc" 2>/dev/null || true
+
+# 3) 开机自启兜底单元（幂等：内容一致就不重写）
+if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+  WANT="[Unit]
+Description=${APP_NAME} fpk 应用（UPS 断电联动）
+# 应用中心开机也会按 DB 状态拉起应用；本单元是兜底：
+# 若走应用中心路径失败（例如 status 判定异常、批量启动被跳过），进程仍能起来。
+# 两边都启动时 start 幂等（端口探活 + pid 校验），不会重复拉。
+After=network-online.target trim_app_center.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/var/apps/${APP_NAME}/cmd/main start
+ExecStop=/var/apps/${APP_NAME}/cmd/main stop
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target"
+
+  if [ "$(cat "$UNIT" 2>/dev/null)" != "$WANT" ]; then
+    printf '%s\n' "$WANT" > "$UNIT" && log "已写入 $UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  systemctl enable "${APP_NAME}-fpk.service" >/dev/null 2>&1 || true
+  systemctl start "${APP_NAME}-fpk.service" >/dev/null 2>&1 || true
+else
+  log "跳过 systemd 兜底（无 systemctl 或非 root）"
+fi
+
+echo "upsbridge $VER" > "$MARK" 2>/dev/null || true
+log "install_callback 完成（$VER）"
 exit 0
