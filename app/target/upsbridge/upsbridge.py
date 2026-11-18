@@ -965,6 +965,13 @@ function atBottom(){ return col.scrollTop + col.clientHeight >= col.scrollHeight
 function toBottom(){ col.scrollTop = col.scrollHeight; q('btnJump').classList.remove('show'); }
 
 function merge(d){
+  var last = d.counts && d.counts.lastSeq;
+  if (last != null && last < state.lastSeq) {
+    // 服务重启后 seq 从头计数，本地游标作废，整页重新载入
+    state.entries = []; state.lastSeq = 0; state.sel = null;
+    detail.classList.remove('show');
+    return poll();
+  }
   if (!d.entries || !d.entries.length) { state.counts = d.counts || state.counts; updateChips(); return; }
   var known = {};
   state.entries.forEach(function(e){ known[e.seq] = 1; });
