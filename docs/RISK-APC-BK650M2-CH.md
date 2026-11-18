@@ -70,11 +70,11 @@
       → 电池耗尽，飞牛硬断电
 
 这不是理论推演，是 upsbridge 的既定行为：
-`app/target/upsbridge/upsbridge.py:337-339` 判 stale 时日志明写「不触发关机」，
+`app/target/upsbridge/upsbridge.py:337-339` 判 stale 时日志明写「不会因此关机」，
 `deadtime` 只是把「连不上」升级成「标记 stale」，从不会转成关机动作。
 
 **所以 §2 的时间差不是调优，是正确性条件。** 拔电演练时必须验证顺序：
-先看到飞牛 app.log 里的「触发条件满足」，再看到绿联关机。
+先看到飞牛 app.log 里的「关机条件已满足」，再看到绿联关机。
 
 ## 4. 待验证项（换机后必须实测，不能靠推测）
 
@@ -192,7 +192,7 @@ BK650M2-CH 官方标称充电 24 小时。
 3. 读一次 `upsc ups0@192.168.68.53`，确认 `battery.charge` 是真数值、`ignorelb` 是否 enabled。
 4. 拔市电演练，按这个顺序核对：
    - 飞牛 app.log 出现「检测到市电中断，开始计时」；
-   - 5 分钟后出现「触发条件满足」+「Shutdown scheduled for …」；
+   - 5 分钟后出现「关机条件已满足」+「Shutdown scheduled for …」；
    - 飞牛关完之后，绿联才开始关；
    - 恢复市电，两边都能正常起来（能不能自动起来不在本次范围）。
 

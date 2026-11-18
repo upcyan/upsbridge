@@ -61,8 +61,8 @@ def guess_level(msg):
     """给老格式（无级别标记）的日志行推断级别，用于读回历史文件。"""
     if msg.startswith("触发关机：") or "关机命令执行失败" in msg:
         return "error"
-    for w in ("失败", "失联", "中断", "未配置", "未填写", "陈旧", "更换电池", "FSD",
-              "演练", "低电量", "复位", "清空"):
+    for w in ("失败", "失联", "中断", "未配置", "还没配置", "未填写", "陈旧", "更换电池",
+              "FSD", "演练", "低电量", "复位", "清空"):
         if w in msg:
             return "warn"
     for w in ("市电恢复", "恢复通信", "启动", "监听", "已保存"):
@@ -301,10 +301,10 @@ def note_status_change(status, st, log):
     if old is None:
         log.add("UPS 状态：" + (status or "(空)"))
     else:
-        log.add("UPS 状态变化：" + (old or "(空)") + " → " + (status or "(空)"))
+        log.add("UPS 状态 " + (old or "(空)") + " → " + (status or "(空)"))
     if "RB" in status.split() and not st.get("rb_warned"):
         st["rb_warned"] = True
-        log.add("上游报告 RB（建议更换电池）：本机不据此关机，仅记录", "warn")
+        log.add("上游报告 RB，建议更换电池；本程序不会因此关机", "warn")
 
 
 class Monitor(threading.Thread):
@@ -326,7 +326,7 @@ class Monitor(threading.Thread):
                 variables, fsd = self.client.poll(up)
                 st["failures"] = 0
                 if st.get("stale"):
-                    log.add("与上游恢复通信 " + (up.get("host") or ""), "ok")
+                    log.add("与上游 " + (up.get("host") or "") + " 恢复通信", "ok")
                 st["stale"] = False
                 self.update_state(variables, fsd, cfg, st, log)
             except Exception as e:
@@ -336,7 +336,7 @@ class Monitor(threading.Thread):
                 st["last_error"] = str(e)
                 if st["failures"] * interval >= deadtime and not st.get("stale"):
                     st["stale"] = True
-                    log.add("与上游失联超过 %ds：%s（不触发关机）" % (deadtime, e), "warn")
+                    log.add("与上游失联超过 %ds（%s），不会因此关机" % (deadtime, e), "warn")
                 time.sleep(min(interval, 3))
                 continue
             time.sleep(interval)
@@ -352,7 +352,7 @@ class Monitor(threading.Thread):
         三道闸（与 FSD 同级的防护）：
           1. 必须在电池供电（on_batt）。市电正常时的 LB 一律不认。
           2. 若上游给出了电量 / 续航数值，必须至少有一个真的低于阈值；
-             数值全部不支持时，判为瞬时抖动，不认。
+             数值全部无法核对时，按瞬时抖动处理，不认。
           3. 认了之后还要持续 lb_grace_seconds 秒（默认 30s）才动作。
         任一道闸挡下都会在日志里写清原因，且只在原因变化时写一次，不刷屏。
         """
@@ -360,7 +360,7 @@ class Monitor(threading.Thread):
 
         if not raw:
             if st.get("lb_since"):
-                log.add("低电量标记消失，取消确认（已持续 %ds，未达动作条件）"
+                log.add("低电量标记消失，取消确认：只持续了 %ds，没到阈值"
                         % int(now - st["lb_since"]), "ok")
             st["lb_since"] = None
             st["lb_note"] = ""
@@ -371,7 +371,7 @@ class Monitor(threading.Thread):
 
         # 闸 1：不在电池供电时的 LB 不可信
         if not on_batt:
-            block = "但市电正常（当前不在电池供电）"
+            block = "但市电正常，不在电池供电"
 
         # 闸 2：数值核对
         if not block:
@@ -385,20 +385,20 @@ class Monitor(threading.Thread):
                 detail.append("续航 %ss（阈值 %ss）"
                               % (fmt_num(runtime), fmt_num(runtime_low)))
             if signals and not any(signals):
-                block = "但数值不支持（" + "、".join(detail) + "）"
+                block = "但读数不支持：" + "、".join(detail)
 
         if block:
             st["lb_since"] = None
             st["lb_note"] = ""
             if st.get("lb_block") != block:
                 st["lb_block"] = block
-                log.add("上游报低电量，" + block + "，判为瞬时抖动，不动作", "warn")
+                log.add("上游上报低电量，" + block + "，按瞬时抖动处理，不关机", "warn")
             return False
 
         st["lb_block"] = ""
         if not st.get("lb_since"):
             st["lb_since"] = now
-            log.add("上游报低电量，开始确认（需持续 %.0fs）" % grace, "warn")
+            log.add("上游上报低电量，开始确认（需连续 %.0fs）" % grace, "warn")
 
         if (now - st["lb_since"]) < grace:
             st["lb_note"] = "确认中（%ds / %.0fs）" % (int(now - st["lb_since"]), grace)
@@ -447,21 +447,21 @@ class Monitor(threading.Thread):
         if fsd and not st.get("seen_ob"):
             if not st.get("fsd_orphan_logged"):
                 st["fsd_orphan_logged"] = True
-                log.add("上游有 FSD 标记，但本次运行未观测到断电，视为陈旧标记，不动作", "warn")
+                log.add("上游有 FSD 标记，但这次启动后没见断电，当作陈旧标记，不关机", "warn")
             fsd = False
 
         # FSD 需持续一段时间才认
         if fsd:
             if not st.get("fsd_since"):
                 st["fsd_since"] = now
-                log.add("上游出现 FSD 标记，开始确认", "warn")
+                log.add("上游发出 FSD 标记，开始确认", "warn")
         else:
             st["fsd_since"] = None
         fsd_grace = float(rules.get("fsd_grace_seconds", 15) or 0)
         if fsd and st.get("fsd_since") and (now - st["fsd_since"]) < fsd_grace:
             if not st.get("fsd_warned"):
                 st["fsd_warned"] = True
-                log.add("上游有 FSD 标记，需持续 %.0fs 才动作（防上游残留状态误触发）" % fsd_grace, "warn")
+                log.add("上游的 FSD 标记要连续 %.0fs 才算数，防止残留状态误触发" % fsd_grace, "warn")
             fsd = False
         elif fsd:
             st["fsd_warned"] = False
@@ -481,7 +481,7 @@ class Monitor(threading.Thread):
 
         if not on_batt and not lb and not fsd:
             if st.get("ob_since"):
-                log.add("市电恢复，取消计时（本次断电 %ds）" % int(now - st["ob_since"]), "ok")
+                log.add("市电恢复，取消计时（这次断电 %ds）" % int(now - st["ob_since"]), "ok")
             st["ob_since"] = None
             st["mode"] = "ONLINE"
             st["reason"] = ""
@@ -490,14 +490,14 @@ class Monitor(threading.Thread):
         if on_batt and not st.get("ob_since"):
             st["ob_since"] = now
             st["seen_ob"] = True
-            log.add("检测到市电中断，开始计时（阈值 %ds）" % int(rules.get("shutdown_on_battery_seconds", 0)), "warn")
+            log.add("市电中断，开始计时（阈值 %ds）" % int(rules.get("shutdown_on_battery_seconds", 0)), "warn")
 
         elapsed = int(now - st["ob_since"]) if st.get("ob_since") else 0
         reason = ""
         if fsd and rules.get("shutdown_on_fsd", True):
-            reason = "上游广播 FSD（强制关机）"
+            reason = "上游广播了 FSD（强制关机）"
         elif lb:
-            reason = "UPS 报低电量（已确认 %ds）" % int(now - st["lb_since"])
+            reason = "UPS 报低电量，已确认 %ds" % int(now - st["lb_since"])
         else:
             thr = int(rules.get("shutdown_on_battery_seconds", 0) or 0)
             if on_batt and thr > 0 and elapsed >= thr:
@@ -516,11 +516,11 @@ class Monitor(threading.Thread):
         st["shutdown_at"] = time.time()
         if rules.get("dry_run", True):
             st["mode"] = "DRY_RUN"
-            log.add("【演练模式】触发条件满足：" + reason + " —— 本应执行关机，未执行", "warn")
+            log.add("【演练模式】关机条件已满足：" + reason + "；只记录，未执行关机", "warn")
             return
         cmd = rules.get("shutdown_cmd", "/sbin/shutdown -h +0")
         st["mode"] = "SHUTTING_DOWN"
-        log.add("触发关机：" + reason + " —— 执行 " + cmd, "error")
+        log.add("触发关机：" + reason + "；执行 " + cmd, "error")
         try:
             subprocess.Popen(cmd, shell=True)
         except Exception as e:
@@ -657,7 +657,7 @@ def make_handler(ctx):
             if p == "/api/logs/clear":
                 n = len(ctx.log.entries)
                 ctx.log.clear()
-                ctx.log.add("运行日志已清空（清掉 %d 条）" % n, "warn")
+                ctx.log.add("运行日志已清空，共删除 %d 条" % n, "warn")
                 return self._json({"ok": True, "cleared": n})
 
             if p == "/api/reset_shutdown":
@@ -665,7 +665,7 @@ def make_handler(ctx):
                 ctx.state["shutdown_reason"] = ""
                 ctx.state["mode"] = "INIT"
                 ctx.state["ob_since"] = None
-                ctx.log.add("手动复位已触发标记（用于再次演练）", "ok")
+                ctx.log.add("已手动复位触发状态，可以再演练一次", "ok")
                 return self._json({"ok": True})
 
             return self._json({"ok": False, "error": "unknown"}, 404)
@@ -1358,24 +1358,24 @@ def main():
     ctx.log = Log(a.log or (here + "/../var/log/app.log"))
     ctx.stop = threading.Event()
     up0 = cfg["upstream"]
-    ctx.log.add("upsbridge %s 启动，上游 %s:%s/%s" % (
+    ctx.log.add("upsbridge %s 启动，上游 %s:%s，UPS 名 %s" % (
         VERSION, up0.get("host") or "(未配置)", up0.get("port"), up0.get("upsname") or "(未配置)"), "ok")
     if not up0.get("host"):
-        ctx.log.add("尚未配置上游地址，请打开管理界面填写", "warn")
+        ctx.log.add("还没配置上游地址，请到管理界面填写", "warn")
     if cfg["rules"].get("dry_run", True):
-        ctx.log.add("演练模式开启：满足关机条件时只记录，不执行", "warn")
+        ctx.log.add("演练模式已开启：满足关机条件时只记录，不真正执行", "warn")
 
     Monitor(ctx).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", a.port), make_handler(ctx))
-    ctx.log.add("管理界面监听 :%d" % a.port, "ok")
+    ctx.log.add("管理界面已启动，端口 %d" % a.port, "ok")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         ctx.stop.set()
-        ctx.log.add("upsbridge 退出", "warn")
+        ctx.log.add("upsbridge 已退出", "warn")
 
 
 if __name__ == "__main__":

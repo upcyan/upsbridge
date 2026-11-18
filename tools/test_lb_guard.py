@@ -98,7 +98,7 @@ def main():
         setstate(**dict(base_ok, **{"ups.status": "OL LB"}))
         time.sleep(4)
         seg = since(n)
-        case("OL LB 不触发关机", "触发条件满足" not in seg, seg.strip().replace("\n", " | ")[:160])
+        case("OL LB 不触发关机", "关机条件已满足" not in seg, seg.strip().replace("\n", " | ")[:160])
         case("OL LB 写明原因", "市电正常" in seg or "不在电池供电" in seg)
 
         print("[2] 电池供电但数值不支持 LB")
@@ -106,15 +106,15 @@ def main():
         n = mark()
         time.sleep(4)
         seg = since(n)
-        case("OB LB 数值不支持时不触发", "触发条件满足" not in seg, seg.strip().replace("\n", " | ")[:160])
-        case("写明数值核对", "数值不支持" in seg)
+        case("OB LB 数值不支持时不触发", "关机条件已满足" not in seg, seg.strip().replace("\n", " | ")[:160])
+        case("写明数值核对", "读数不支持" in seg)
 
         print("[3] 真低电量：OB + LB + 电量 10% < 阈值 15%")
         n = mark()
         setstate(**dict(base_ok, **{"ups.status": "OB LB", "battery.charge": 10,
                                     "battery.runtime": 90}))
         # 注意：启动日志里本身就有"演练模式"字样，必须等真正的触发行
-        ok = wait_contains("触发条件满足", 15)
+        ok = wait_contains("关机条件已满足", 15)
         seg = since(n)
         case("真低电量触发（演练）", ok, seg.strip().replace("\n", " | ")[:200])
         case("触发原因带确认时长", "已确认" in seg, seg.strip().replace("\n", " | ")[-260:])
@@ -130,7 +130,7 @@ def main():
         setstate(**dict(base_ok, **{"ups.status": "OB", "battery.charge": 60}))
         time.sleep(4)
         seg = since(n)
-        case("LB 消失后不触发", "触发条件满足" not in seg, seg.strip().replace("\n", " | ")[:160])
+        case("LB 消失后不触发", "关机条件已满足" not in seg, seg.strip().replace("\n", " | ")[:160])
         case("写明取消确认", "取消确认" in seg)
 
         print("[5] 断电时长规则仍然有效")
