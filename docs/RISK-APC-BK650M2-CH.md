@@ -95,7 +95,7 @@
 
 换机后先看一眼固件版本，决定走 §2 的哪一套。
 
-### 4.3 APC 的假低电量（必踩，但已被 1.1.0 挡住）
+### 4.3 APC 的假低电量：怪谁？
 
 同型号实测：`battery.charge 98` / `battery.charge.low 96`，差 2% 就判 LB。
 绿联给自家的 US3000 设了 `driver.flag.ignorelb: enabled`，说明他们也踩过。
@@ -103,8 +103,58 @@
 
     upsc ups0@192.168.68.53 | grep -E 'ignorelb|charge.low|battery.charge:'
 
+**是谁的问题：三者都不是，但责任能分清。**
+
+排除电池。本机同时刻读数：`battery.charge 100`、`battery.voltage 13.5`
+（标称 12V 满充）、`battery.runtime 2403s`、`ups.test.result "Done and passed"`、
+`ups.mfr.date 2026/07/24`（四个月前出厂）。一条都不指向老化。
+`battery.mfr.date` 曾经读到 2001/01/01 —— 那是寄存器里写 0，
+被 `apc-hid.c:109 apc_date_conversion_fun` 反解成 2001，不是"电池 2001 年生产"。
+
+不是绿联的自研 bug。绿联 NUT Server 报 `driver.version 2.8.0`、
+`driver.version.data "APC HID 0.98"`，就是**原版 NUT 2.8.0 的 usbhid-ups** 在跑，
+一行没改。它转发 LB 是因为 NUT 2.8.0 本来就没有任何防抖机制（见下）。
+
+是 APC 固件瞬时置位 + NUT 旧版本没有延迟机制，两者相加。
+NUT 官方 usbhid-ups 手册（`networkupstools.org/docs/man/usbhid-ups.html`）
+在 `lbrb_log_delay_sec` 条目里**点名了这个型号**：
+
+> Some APC BXnnnnMI device models or firmware versions (reportedly 2023-2024),
+> or APC BVKnnnnM2 device models, or **APC BKnnnnM2-CH (a China-market-only model)**,
+> frequently report "low battery", "replace battery", and "all ok" states
+> changing rapidly within a couple of seconds, sometimes (but not always)
+> preceded by OL+DISCHRG (presumably calibration).
+
+即：APC 固件在 `UPS.PowerSummary.PresentStatus.BelowRemainingCapacityLimit`
+这一位上会在一两秒内反复置位/复位（`apc-hid.c:380` 是 LB 的唯一来源），
+NUT 把它当作"已知的厂商固件现象"来兼容，而不是当成绿联的错。
+
+NUT 加的修复是 `lbrb_log_delay_sec`（`usbhid-ups.c` 2.8.5-1）：
+设备进入 LB / LB+RB 后先不置位，持续超过 N 秒才认。
+`BK…M2-CH` 匹配在一段型号自动判定里（`usbhid-ups.c:1865-1977`，条件是
+vendor 为 APC 且 productLen>9 且以 `M2` + `-`/`_` + `CH` 结尾），
+命中即默认 3 秒，还会建议同时加 `lbrb_log_delay_without_calibrating`。
+
+版本对得上：Debian 的 2.8.0-7 与 2.8.1-5 的 `usbhid-ups.c` 里
+grep `lbrb_log_delay` 命中 **0** 次，2.8.5-1 才有。
+所以绿联这套（2.8.0）不是配错，是**根本没有这个参数**。
+
+还有一个容易漏的坑（NUT issue #2942 里就栽在这）：
+`usbhid-ups.c:2897-2921` 的判断是
+`if (lbrb_log_delay_sec < 1 || (!isCalibrating && !lbrb_log_delay_without_calibrating) || !(ups_status & STATUS(ONLINE)))`
+→ 市电正常时 `isCalibrating` 为假，若不显式加 `lbrb_log_delay_without_calibrating`，
+延迟**照样不生效**。而且最后那项 `!(ups_status & STATUS(ONLINE))`
+意味着"一旦不是在线态就不延迟"——在线位抖动的那一瞬间，LB 直接漏出去。
+
+**能不能在绿联侧修？不能。** 绿联的 UPS 设置页没有 ups.conf 编辑入口，
+`driver.flag.ignorelb` 是它给自家 US3000 预置的，用户改不了别人的驱动参数。
+所以只能在客户端（飞牛 upsbridge）挡。
+
 upsbridge 侧已有三道闸（必须在电池供电 / 数值必须真的低于阈值 / 持续 30 秒），
 所以即使 APC 抖 LB，也不会像 1.0.1 那样立刻关机。这条已经从「风险」降级为「观察项」。
+
+也可以顺手把绿联的读数拉来做交叉验证——抖的时候上游 `battery.charge`
+不会真的掉下去，这就是最直接的否证。
 
 ### 4.4 NUT 2.8 能不能让 APC 断电
 
