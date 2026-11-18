@@ -123,6 +123,8 @@ app/                    fpk 源（manifest / cmd / config / ui / target）
   target/upsbridge/upsbridge.py   主程序，零第三方依赖
   target/upsbridge/config.default.json
 docs/                   调研记录与方案对比
+  docs/MIGRATION-APC.md           换成 APC 后的部署方案（架构、时序、验证清单）
+  docs/RISK-APC-BK650M2-CH.md   换机后的剩余风险、电池续航与等待时间预算表
 examples/              NUT primary/secondary 配置样例与关机脚本
 tools/pack.sh          打包 -> dist/upsbridge_<version>.fpk
 tools/mockupsd.py      可控假 upsd，用于本地测触发逻辑
