@@ -31,11 +31,12 @@
 |---|---|
 | 轮询上游 | 默认 5s，读 `ups.status` / `battery.charge` / `battery.runtime` / `device.mfr` + `model` |
 | 断电时长判定 | 市电中断持续 N 秒后关机（N 可配，0 = 关闭） |
-| 低电量判定 | 收到 `LB`，或电量低于自定义阈值 |
+| 低电量判定 | 收到 `LB`（须在电池供电 + 数值确实低 + 持续 N 秒），或电量低于自定义阈值 |
 | 强制关机 | 收到上游广播的 `FSD` |
 | 通信中断 | 按 `deadtime` 判为 stale，**只报警不关机** |
 | 演练模式 | 默认开启，触发只写日志，不真的关机 |
-| 管理界面 | 状态卡、上游连接测试、规则编辑、日志实时刷新 |
+| 管理界面 | 状态卡、上游连接测试、规则编辑 |
+| 运行日志 | 独立子页 `/log`：保留最近 2000 条并落盘，按级别着色（信息 / 正常 / 注意 / 严重），支持关键词搜索、级别筛选、时间间隔提示、单条详情、导出下载、清空 |
 
 ## 安装
 
@@ -74,6 +75,7 @@ trim-cli app install-fpk /path/to/upsbridge_1.0.0.fpk --accept-license --yes
 | `poll_interval` | 5 | 轮询间隔（秒） |
 | `shutdown_cmd` | `/sbin/shutdown -h +0` | 触发时执行的命令 |
 | `fsd_grace_seconds` | 15 | `FSD` 需持续多久才动作（见下） |
+| `lb_grace_seconds` | 30 | `LB` 需持续多久才动作（见下） |
 | `dry_run` | **true** | 演练模式：只记日志不关机 |
 
 ## 首次使用建议
@@ -82,7 +84,7 @@ trim-cli app install-fpk /path/to/upsbridge_1.0.0.fpk --accept-license --yes
 2. 做一次真实断电演练（拔插排），对着日志确认判定符合预期；
 3. 确认无误后再关掉演练模式。
 
-## 两个已踩过的坑
+## 三个已踩过的坑
 
 ### 上游残留的 FSD
 
@@ -95,12 +97,24 @@ NUT 没有「清除 FSD」的命令——发过一次 `FSD` 后，上游 `ups.st
 2. **本次运行期间必须曾观测到断电（`OB`）**，才承认 `FSD` 是本次断电的信号；
    否则视为陈旧标记，只记一行日志：`上游有 FSD 标记，但本次运行未观测到断电，视为陈旧标记，不动作`。
 
-### 假低电量
+### 瞬时假低电量（曾导致两次误关机）
 
-部分 APC 机型（如 BK650M2-CH）的 `battery.charge.low` 是校准告警点而非关机门限，
-可能出现 `charge: 98` / `charge.low: 96`，NUT 判低电量于是一断电就关。
-对策是让上游驱动加 `ignorelb`（绿联的实现默认就带），并用本应用的
-`battery_charge_low_override` 或「断电时长」代替百分比判定。
+部分 APC / UGREEN HID 驱动会在 `CHRG` 状态切换时**瞬时**把 `LB` 位置起来，典型表现是
+上游状态报 `OL LB`（市电正常却低电量），同一时刻 `battery.charge` 还是 100%。
+本机实测一天抖十几次，和 `RB` 抖动同源。
+
+1.0.1 及更早版本见到 `LB` 就关机，于是 2026-11-17 16:11 与 2026-11-18 03:16 两次在
+市电正常的情况下关机。现在 `LB` 要过三道闸：
+
+1. 必须在电池供电（`OB`）—— 市电正常时的 `LB` 一律不认；
+2. 电量或续航至少一个真的低于阈值（`battery.charge.low` / `battery.runtime.low`）；
+3. 上述条件须持续 `lb_grace_seconds`（默认 30s）。
+
+被挡下时日志会写明是哪一道闸挡的，例如
+`上游报低电量，但市电正常（当前不在电池供电），判为瞬时抖动，不动作`。
+
+另外，部分机型的 `battery.charge.low` 是校准告警点而非关机门限（如 `charge: 98` /
+`charge.low: 96`），可用 `battery_charge_low_override` 覆盖。
 
 ## 目录
 
@@ -112,6 +126,8 @@ docs/                   调研记录与方案对比
 examples/              NUT primary/secondary 配置样例与关机脚本
 tools/pack.sh          打包 -> dist/upsbridge_<version>.fpk
 tools/mockupsd.py      可控假 upsd，用于本地测触发逻辑
+tools/mockupsd3.py     JSON 状态文件驱动的假 upsd（时序演练用）
+tools/test_lb_guard.py 低电量三道闸的时序演练（9 个断言）
 tools/mkicon.py        生成应用图标 PNG
 ```
 
@@ -128,7 +144,8 @@ bash tools/pack.sh          # 产出 dist/upsbridge_<version>.fpk
 ## 本地测触发逻辑
 
 ```bash
-python3 tools/mockupsd.py            # 起一个假 upsd（默认 13493）
+python3 tools/test_lb_guard.py       # 低电量三道闸的时序演练，全部走假 upsd
+python3 tools/mockupsd.py            # 手动起一个假 upsd（默认 13493）
 # 用 stdin 控制：status=OB / status=OL / fsd=1 / fsd=0
 ```
 
