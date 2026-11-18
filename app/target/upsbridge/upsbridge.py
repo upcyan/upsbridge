@@ -8,7 +8,7 @@ import argparse, json, os, socket, sys, threading, time, subprocess, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 DEFAULT_CONFIG = {
     # 上游地址留空：首次使用必须由用户在界面里填写，仓库里不写死任何 IP / 账号 / 密码。
