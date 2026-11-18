@@ -1,4 +1,5 @@
 # 构建产物
+dist
 dist/
 app/app.tgz
 app/target/ui/
@@ -6,6 +7,9 @@ app/target/ui/
 # 运行时
 __pycache__/
 *.pyc
+
+# 临时截图
+.oil-ui/
 
 # 编辑器 / 系统
 .vscode/
