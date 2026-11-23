@@ -8,6 +8,12 @@
 #   /var/apps/upsbridge/target/upsbridge/upsbridge.py
 #   /var/apps/upsbridge/target/ui/      桌面入口
 #   /vol1/@appdata/upsbridge/           -> var/
+#
+# 权限模型（本版起）：
+#   本脚本以 root 运行，只负责起停。
+#   - 一个极小的 root 助手（privileged.py）只做 ping 与关机两件事；
+#   - 前台服务降权到 $APP_USER 跑，Web 与配置读写都不再有 root 权限。
+#   任一环节不可用（没这个用户、没 setpriv），退回 root 直跑，功能不降级。
 set -u
 
 # fnOS 调用生命周期脚本时不保证 PATH（见 CyanNVR 踩坑注释），显式补上
@@ -26,11 +32,30 @@ VAR="$APP_HOME/var"; RUN="$VAR/run"; LOG="$VAR/log"; ETC="$APP_HOME/etc"
 mkdir -p "$RUN" "$LOG" "$ETC"
 
 PIDFILE="$RUN/app.pid"
+HELPER_PIDFILE="$RUN/priv.pid"
 PORT="${UPSBRIDGE_PORT:-28190}"
 APP="$APP_HOME/target/upsbridge/upsbridge.py"
 CONF="$ETC/config.json"
+HELPER_SRC="$APP_HOME/target/upsbridge/privileged.py"
+# 助手副本只从 root 专属目录运行：应用目录归应用用户，若直接从那儿跑，
+# 任何能改应用目录的人就等于能改一段以 root 执行的脚本。
+PRIV_DIR="$ETC/priv"
+HELPER="$PRIV_DIR/privileged.py"
+PRIV_SOCK="$RUN/priv.sock"
+APP_USER="${UPSBRIDGE_USER:-upsbridge}"
 
 log() { printf "[upsbridge] %s\n" "$*"; }
+
+# 应用用户：fnOS 安装时按 config/privilege 的 username 建好。
+# 取不到 uid 或没有 setpriv 就退回 root 直跑 —— 宁可少一层防护也不能起不来。
+app_uid() { getent passwd "$APP_USER" 2>/dev/null | cut -d: -f3; }
+app_gid() { getent passwd "$APP_USER" 2>/dev/null | cut -d: -f4; }
+
+drop_priv_available() {
+  [ -n "$(app_uid)" ] || return 1
+  command -v setpriv >/dev/null 2>&1 || return 1
+  return 0
+}
 
 # 端口探活：不依赖 curl，/dev/tcp 是 bash 内建的
 port_open() {
@@ -91,6 +116,43 @@ WantedBy=multi-user.target"
   systemctl is-enabled upsbridge-fpk.service >/dev/null 2>&1 || systemctl enable upsbridge-fpk.service >/dev/null 2>&1 || true
 }
 
+# 部署 root 助手：副本落在 $ETC/priv（root:root 700）。
+deploy_helper() {
+  [ "$(id -u)" = "0" ] || return 1
+  [ -f "$HELPER_SRC" ] || return 1
+  mkdir -p "$PRIV_DIR" 2>/dev/null || return 1
+  if ! cmp -s "$HELPER_SRC" "$HELPER" 2>/dev/null; then
+    cp -f "$HELPER_SRC" "$HELPER" 2>/dev/null || return 1
+  fi
+  chown root:root "$PRIV_DIR" "$HELPER" 2>/dev/null
+  chmod 700 "$PRIV_DIR" 2>/dev/null
+  chmod 700 "$HELPER" 2>/dev/null
+  return 0
+}
+
+start_helper() {
+  [ "$(id -u)" = "0" ] || return 1
+  drop_priv_available || return 1
+  deploy_helper || return 1
+  command -v "$PY" >/dev/null 2>&1 || return 1
+  rm -f "$PRIV_SOCK" 2>/dev/null
+  local gid_group
+  gid_group="$(getent group "$APP_USER" 2>/dev/null | cut -d: -f1)"
+  setsid "$PY" "$HELPER" --socket "$PRIV_SOCK" \
+      --group "$gid_group" --allow-uid "$(app_uid)" \
+      < /dev/null >> "$LOG/priv.log" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$HELPER_PIDFILE"
+  local i=0
+  while [ $i -lt 20 ]; do
+    [ -S "$PRIV_SOCK" ] && { log "特权助手已就绪 (pid $pid)"; return 0; }
+    sleep 0.25; i=$((i+1))
+  done
+  log "特权助手启动失败，退回 root 直跑"
+  rm -f "$HELPER_PIDFILE" "$PRIV_SOCK" 2>/dev/null
+  return 1
+}
+
 do_start() {
   ensure_unit
   if port_open; then
@@ -104,12 +166,37 @@ do_start() {
   rm -f "$PIDFILE"
   if [ ! -f "$APP" ]; then log "找不到主程序 $APP"; return 1; fi
   [ -f "$CONF" ] || cp "$APP_HOME/target/upsbridge/config.default.json" "$CONF"
+
+  # 降权前提：目录得让应用用户写得进去，否则配置和日志都存不下
+  local use_drop=0
+  if drop_priv_available; then
+    chown -R "$(app_uid):$(app_gid)" "$VAR" "$ETC" 2>/dev/null || true
+    chmod 750 "$VAR" "$ETC" 2>/dev/null || true
+    use_drop=1
+  else
+    log "没有 $APP_USER 用户或 setpriv，本次以 root 运行"
+  fi
+
+  local priv_args=()
+  if [ "$use_drop" = "1" ]; then
+    if start_helper; then
+      priv_args=(--priv-sock "$PRIV_SOCK")
+    else
+      use_drop=0
+      log "助手不可用，本次以 root 运行"
+    fi
+  fi
+
   # setsid：把服务放进独立会话/进程组。
   # ⚠️ 实测 1.0.1 装好后 19 秒进程凭空消失、事件日志记 APP_CRASH，app.log 里既没有
   # 异常也没有退出记录（stdout.log 一个字节没写）—— 那是被信号杀掉的典型特征：
   # 应用中心拉起应用后按进程组回收，nohup 只挡 SIGHUP、挡不住整组 SIGTERM。
   # setsid 之后本进程组不再等于调用方，收不到这种连带信号。
-  if command -v setsid >/dev/null 2>&1; then
+  if [ "$use_drop" = "1" ]; then
+    setsid setpriv --reuid "$(app_uid)" --regid "$(app_gid)" --init-groups \
+        "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" "${priv_args[@]}" \
+        < /dev/null >> "$LOG/stdout.log" 2>&1 &
+  elif command -v setsid >/dev/null 2>&1; then
     setsid "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" \
         < /dev/null >> "$LOG/stdout.log" 2>&1 &
   else
@@ -125,7 +212,10 @@ do_start() {
   echo "$pid" > "$PIDFILE"
   local i=0
   while [ $i -lt 15 ]; do
-    if port_open; then log "已启动 (pid $pid, :$PORT)"; return 0; fi
+    if port_open; then
+      log "已启动 (pid $pid, :$PORT, 用户 $( [ "$use_drop" = "1" ] && echo "$APP_USER" || echo root ))"
+      return 0
+    fi
     [ -d "/proc/$pid" ] || break
     sleep 1; i=$((i+1))
   done
@@ -145,6 +235,15 @@ do_stop() {
   # 兜底：pidfile 丢失/失效时按命令行清理残留进程，避免端口被占着起不来
   pkill -f "$APP" 2>/dev/null
   rm -f "$PIDFILE"
+
+  local hpid; hpid="$(tr -dc '0-9' < "$HELPER_PIDFILE" 2>/dev/null)"
+  if [ -n "$hpid" ] && [ -d "/proc/$hpid" ]; then
+    kill "$hpid" 2>/dev/null
+    sleep 1
+    [ -d "/proc/$hpid" ] && kill -9 "$hpid" 2>/dev/null
+  fi
+  pkill -f "$HELPER" 2>/dev/null
+  rm -f "$HELPER_PIDFILE" "$PRIV_SOCK"
   log "已停止"
 }
 

@@ -1,3 +1,84 @@
+## upsbridge 1.3.0
+
+调研了两个同类应用之后收紧了自己，也补了三块原来缺的能力。
+
+### 访问收口
+
+之前服务监听 `0.0.0.0:28190`，而且 `GET /api/config` 会原样吐出上游 NUT 的账号密码。用 `curl 127.0.0.1:28190/api/config` 就能拿到明文，`POST /api/test` 也没有任何鉴权。
+
+现在：
+
+- 默认只绑 `127.0.0.1`，桌面打开走本机代理，行为不变；
+- 确实需要局域网直连时把 `server.bind` 改成 `0.0.0.0`，此时**必须**配 `server.token`，否则非回环请求一律 401；
+- 密码永不回传，接口只告诉你「设过没设过」；页面密码框留空表示不修改，不会因为改了轮询间隔就把密码冲掉。
+
+### 断电事件记录
+
+`/log` 是流水账，适合查「那一刻发生了什么」。但要回答「这个月停了几次电、最长多久、电量最低掉到多少」，逐行翻日志不合适。
+
+新增 `Events` 账本，每次断电记一条：开始时间、结束时间、持续秒数、期间最低电量、结束原因、有没有真的关机。落盘 `events.jsonl`，保留 500 条，`GET /api/events` 可查，同时返回统计（总次数、最长时间、平均时长、最近 30 天次数）。
+
+日志回答过程，事件回答结论。
+
+### 旁路验证
+
+上游 NUT 连不上时，原来看不出是网络问题还是真断电，只能等。现在可以配一个 `witness_host` —— 一台和市电同生共死的设备（路由器、交换机，不能带电池）：
+
+- 上游刚判 stale 时 ping 一次；
+- 通则日志写「说明是网络或上游服务的问题，不是断电」；
+- 不通则写「外部设备同样断电的可能性较大」。
+
+它**只提供交叉证据，绝不单独触发关机**。ping 不通的原因太多——目标机重启、VLAN 变更、防火墙改规则——拿它当真值太脆弱。
+
+### Webhook 通知
+
+`notify.webhook_url` 填个地址就行，JSON POST，带 `event` / `level` / `title` / `detail` / `host` / `time`。
+
+三类事件可分别开关：`shutdown`（含演练触发）、`recover`、`stale`。界面上有「测试通知」按钮。
+
+不引第三方库、不重试、不排队——断电这条命脉上，任何"稍后重试"的设计都不如让调用方自己决定要不要发。发送失败只写日志，永远不阻塞关机。
+
+### 权限模型
+
+原来整个进程以 root 跑，Web 服务、配置读写、关机全在一个身份里。改成两层：
+
+```
+cmd/main（root）
+  ├─ root 助手 privileged.py  → 只认 ping 与 poweroff 两条命令
+  └─ 前台服务（降权到 upsbridge 用户）→ Web、配置、日志都没有 root 权限
+```
+
+助手只监听 unix socket：权限 0660、`SO_PEERCRED` 核对对端 uid、ping 目标做格式校验并禁止 `-` 开头（防参数注入）、单连接只处理一行 4KB 的 JSON。助手副本放 `etc/priv/`（root 700），不从应用目录直接执行——否则能改应用目录的人就等于能改一段以 root 跑的代码。
+
+没有 `upsbridge` 用户或没有 `setpriv` 时自动退回 root 直跑，功能不降级。
+
+### 验证
+
+- `tools/test_lb_guard.py` 9/9 通过
+- 回环访问：`/api/config` 密码为空、`password_set: true`，写操作正常，磁盘上密码未被冲掉
+- 局域网来源：无 token 401、错 token 401、对 token 200，POST 同样拦
+- 旁路验证：停掉假 upsd 后正确记录「旁路设备仍通，说明是网络问题」
+- 通知：本地起接收端，收到 `test` 与 `shutdown` 两条，字段完整
+- 助手：未知命令拒绝、参数注入拒绝、ping 正常
+
+## upsbridge 1.2.0
+
+新增 Windows 版和 Docker 版，fnOS 版行为不变。
+
+核心程序还是那一份 `app/target/upsbridge/upsbridge.py`，只加了平台感知：
+
+- **关机命令**按平台取默认值：Linux `/sbin/shutdown -h +0`、Windows `shutdown /s /t 0`、容器里用环境变量 `UPSBRIDGE_SHUTDOWN_CMD` 覆盖成 nsenter 关宿主机。界面「关机命令」留空也算用平台默认。
+- **配置与日志路径**按平台选：Windows 用 `%APPDATA%\upsbridge\`，日志落同目录 `upsbridge.log`；不传 `--config` 时 Linux 仍然报错（fnOS 脚本总是显式传，行为零变化）。
+
+两个新目录：
+
+| 目录 | 内容 |
+|---|---|
+| `windows/` | `run.bat` 临时运行；`install-autostart.ps1` 计划任务开机自启（SYSTEM 身份、配置固定在 `%ProgramData%\upsbridge%`、建防火墙规则）；`uninstall-autostart.ps1` 反向清理 |
+| `docker/` | Dockerfile + docker-compose.yml；`pid: host` + `privileged`，默认关机命令 `nsenter -t 1 … /sbin/shutdown -h now` 进宿主 PID 1；配置日志持久化到挂载卷 `data/` |
+
+验证：低电量三道闸时序演练 9/9 通过；本地冒烟（health / 配置读写 / 环境变量覆盖 / Linux 缺 --config 报错）通过；Docker 镜像构建后容器 healthy，nsenter 就位、dry_run 默认开、数据落卷。
+
 ## upsbridge 1.1.1
 
 只改文案，不动逻辑。

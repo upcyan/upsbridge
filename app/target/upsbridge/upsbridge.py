@@ -4,11 +4,20 @@
 
 不依赖也不修改 /etc/nut：自己实现 NUT 协议客户端，配置全部在本应用目录里。
 """
-import argparse, json, os, socket, sys, threading, time, subprocess, re
+import argparse, hmac, ipaddress, json, os, socket, sys, threading, time, subprocess, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.1.1"
+VERSION = "1.3.0"
+
+# 平台感知：Windows 与 Linux 的默认关机命令不同；
+# 容器里可用环境变量 UPSBRIDGE_SHUTDOWN_CMD 覆盖（Docker 版靠它指向宿主机关机）。
+IS_WINDOWS = os.name == "nt"
+DEFAULT_SHUTDOWN_CMD = (
+    os.environ.get("UPSBRIDGE_SHUTDOWN_CMD")
+    or ("shutdown /s /t 0" if IS_WINDOWS else "/sbin/shutdown -h +0")
+)
 
 DEFAULT_CONFIG = {
     # 上游地址留空：首次使用必须由用户在界面里填写，仓库里不写死任何 IP / 账号 / 密码。
@@ -24,9 +33,18 @@ DEFAULT_CONFIG = {
         "battery_charge_low_override": 0,
         "deadtime": 30,
         "poll_interval": 5,
-        "shutdown_cmd": "/sbin/shutdown -h +0",
+        "shutdown_cmd": DEFAULT_SHUTDOWN_CMD,
+        # 旁路验证：上游 NUT 失联时，ping 一台「和市电同生共死」的设备来判断
+        # 到底是网络问题还是真断电。留空则不启用，行为与以前完全一致。
+        "witness_host": "",
+        "witness_timeout": 2,
+        "witness_on_stale": True,
     },
-    "notify": {"wall": True},
+    # 监听与鉴权：默认只绑回环，fnOS 桌面网关在本机代理进来就能用；
+    # 要局域网直连必须显式改 bind，并配 token（否则 API 拒绝非回环请求）。
+    "server": {"bind": "127.0.0.1", "token": ""},
+    # 通知：webhook_url 留空则不推送。只做一个通道，够用就好。
+    "notify": {"webhook_url": "", "timeout": 5, "notify_on": ["shutdown", "recover", "stale"]},
 }
 
 
@@ -311,6 +329,8 @@ class Monitor(threading.Thread):
     def __init__(self, ctx):
         super().__init__(daemon=True)
         self.ctx = ctx
+        self.events = ctx.get("events")
+        self.notifier = ctx.get("notifier")
         self.client = NutClient(ctx["state"], ctx["log"])
 
     def run(self):
@@ -337,9 +357,61 @@ class Monitor(threading.Thread):
                 if st["failures"] * interval >= deadtime and not st.get("stale"):
                     st["stale"] = True
                     log.add("与上游失联超过 %ds（%s），不会因此关机" % (deadtime, e), "warn")
+                    self.note_witness(cfg, st, log)
+                    if self.notifier:
+                        w = st.get("witness") or {}
+                        extra = ""
+                        if w.get("ok") is True:
+                            extra = "；旁路设备 %s 仍通，多半是网络问题" % w.get("host")
+                        elif w.get("ok") is False:
+                            extra = "；旁路设备 %s 也不通，可能真断电" % w.get("host")
+                        self.notifier.send("stale", "与 UPS 上游失联",
+                                           "%s%s" % (e, extra), "warn")
                 time.sleep(min(interval, 3))
                 continue
             time.sleep(interval)
+
+    def note_witness(self, cfg, st, log):
+        """上游刚判失联时做一次旁路验证，把「网络问题」和「真断电」分开。"""
+        rules = cfg["rules"]
+        if not rules.get("witness_on_stale", True):
+            return
+        host = (rules.get("witness_host") or "").strip()
+        if not host:
+            return
+        ok = self.probe_witness(cfg, st)
+        if ok is None:
+            log.add("旁路验证 %s 不可用，无法区分是网络故障还是断电" % host, "warn")
+        elif ok:
+            log.add("旁路验证 %s 仍然通，说明是网络或上游服务的问题，不是断电" % host, "ok")
+        else:
+            log.add("旁路验证 %s 也 ping 不通，外部设备同样断电的可能性较大" % host, "warn")
+
+    def probe_witness(self, cfg, st):
+        """ping 旁路设备，返回 True/False/None（None=不可用或没配置）。
+
+        用途只有一个：上游失联时区分「我们连不上 UPS」和「真的停电了」。
+        它只写日志、提供交叉证据，绝不单独触发关机 —— 因为 ping 不通的原因
+        太多（目标机重启、VLAN 变更、防火墙改规则），拿它当真值太脆弱。
+        """
+        rules = cfg["rules"]
+        host = (rules.get("witness_host") or "").strip()
+        if not host:
+            return None
+        if not re.match(r"^[A-Za-z0-9._:-]+$", host) or host.startswith("-"):
+            return None
+        try:
+            timeout = int(rules.get("witness_timeout") or 2)
+        except (TypeError, ValueError):
+            timeout = 2
+        timeout = max(1, min(10, timeout))
+        ok, _err = run_ping(host, timeout)
+        st["witness"] = {
+            "host": host,
+            "ok": ok,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return ok
 
     def confirm_low_battery(self, raw, on_batt, charge, runtime,
                             charge_low_up, runtime_low, rules, st, log, now):
@@ -439,6 +511,8 @@ class Monitor(threading.Thread):
         # token 精确匹配：子串匹配会被 "OL RB" 之类的组合状态误命中
         on_batt = "OB" in tokens
         lb_raw = "LB" in tokens
+        if self.events is not None and st.get("ob_since"):
+            self.events.touch("outage", charge=charge, elapsed=now - st["ob_since"])
         if low_override > 0 and charge is not None and charge <= low_override:
             lb_raw = True
 
@@ -481,7 +555,13 @@ class Monitor(threading.Thread):
 
         if not on_batt and not lb and not fsd:
             if st.get("ob_since"):
-                log.add("市电恢复，取消计时（这次断电 %ds）" % int(now - st["ob_since"]), "ok")
+                lasted = int(now - st["ob_since"])
+                log.add("市电恢复，取消计时（这次断电 %ds）" % lasted, "ok")
+                if self.events is not None:
+                    self.events.close_event("outage", "市电恢复")
+                if self.notifier:
+                    self.notifier.send("recover", "市电已恢复",
+                                       "本次断电持续 %d 秒" % lasted, "ok")
             st["ob_since"] = None
             st["mode"] = "ONLINE"
             st["reason"] = ""
@@ -491,6 +571,11 @@ class Monitor(threading.Thread):
             st["ob_since"] = now
             st["seen_ob"] = True
             log.add("市电中断，开始计时（阈值 %ds）" % int(rules.get("shutdown_on_battery_seconds", 0)), "warn")
+            if self.events is not None:
+                ev = self.events.open_event("outage", "市电中断")
+                if charge is not None:
+                    ev["min_charge"] = charge
+                    self.events.touch("outage", charge=charge)
 
         elapsed = int(now - st["ob_since"]) if st.get("ob_since") else 0
         reason = ""
@@ -511,20 +596,237 @@ class Monitor(threading.Thread):
 
     def trigger_shutdown(self, reason, cfg, st, log):
         rules = cfg["rules"]
+        if self.events is not None:
+            self.events.close_event("outage", reason, shutdown=True)
         st["shutdown_issued"] = True
         st["shutdown_reason"] = reason
         st["shutdown_at"] = time.time()
         if rules.get("dry_run", True):
             st["mode"] = "DRY_RUN"
             log.add("【演练模式】关机条件已满足：" + reason + "；只记录，未执行关机", "warn")
+            if self.notifier:
+                self.notifier.send("shutdown", "【演练】本应关机",
+                                   reason, "warn")
             return
-        cmd = rules.get("shutdown_cmd", "/sbin/shutdown -h +0")
+        cmd = rules.get("shutdown_cmd") or DEFAULT_SHUTDOWN_CMD
         st["mode"] = "SHUTTING_DOWN"
         log.add("触发关机：" + reason + "；执行 " + cmd, "error")
+        if self.notifier:
+            self.notifier.send("shutdown", "已触发关机", reason, "error")
+        res = privileged({"cmd": "poweroff"})
+        if res is not None:
+            if res.get("ok"):
+                log.add("已通过特权助手提交关机", "error")
+            else:
+                log.add("特权助手关机失败：" + str(res.get("error") or ""), "error")
+            return
         try:
             subprocess.Popen(cmd, shell=True)
         except Exception as e:
             log.add("关机命令执行失败：" + str(e), "error")
+
+
+class Notifier:
+    """极简 webhook 推送。
+
+    只发 JSON POST，不引第三方库、不重试、不排队 —— 断电这条命脉上，
+    任何"稍后重试"的设计都不如让调用方自己决定要不要发。
+    失败只写日志，绝不阻塞关机流程。
+    """
+
+    def __init__(self, log, get_cfg):
+        self.log = log
+        self.get_cfg = get_cfg
+        self.lock = threading.Lock()
+
+    def enabled(self, event):
+        cfg = (self.get_cfg() or {}).get("notify") or {}
+        url = (cfg.get("webhook_url") or "").strip()
+        if not url:
+            return False
+        on = cfg.get("notify_on")
+        if isinstance(on, list) and on:
+            return event in on
+        return True
+
+    def send(self, event, title, detail="", level="warn"):
+        if not self.enabled(event):
+            return False
+        cfg = (self.get_cfg() or {}).get("notify") or {}
+        url = (cfg.get("webhook_url") or "").strip()
+        if not re.match(r"^https?://", url, re.I):
+            self.log.add("通知地址不是 http(s)，已跳过：" + url[:40], "warn")
+            return False
+        try:
+            timeout = float(cfg.get("timeout") or 5)
+        except (TypeError, ValueError):
+            timeout = 5.0
+        payload = json.dumps({
+            "app": "upsbridge",
+            "version": VERSION,
+            "event": event,
+            "level": level,
+            "title": title,
+            "detail": detail,
+            "host": socket.gethostname(),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }, ensure_ascii=False).encode("utf-8")
+
+        def worker():
+            req = urllib.request.Request(
+                url, data=payload, method="POST",
+                headers={"Content-Type": "application/json; charset=utf-8"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    code = getattr(resp, "status", 200)
+                if 200 <= code < 300:
+                    self.log.add("已推送通知（%s）" % event, "ok")
+                else:
+                    self.log.add("通知返回 HTTP %s（%s）" % (code, event), "warn")
+            except Exception as exc:
+                self.log.add("通知发送失败（%s）：%s" % (event, exc), "warn")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return True
+
+
+class Events:
+    """断电事件账本。
+
+    /log 是流水账，适合排查「那一刻发生了什么」；这里记的是「一件事的起止」：
+    什么时候开始断电、什么时候恢复、中间最低电量掉到多少、为什么关机。
+    两者互补 —— 日志回答过程，事件回答结论。
+
+    存储用 JSONL，追加写；只保留最近 cap 条。
+    """
+
+    def __init__(self, path, cap=500):
+        self.path = path
+        self.cap = cap
+        self.items = []
+        self._seq = 0
+        self.lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-self.cap:]
+        except OSError:
+            return
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and e.get("id"):
+                self._seq = max(self._seq, int(e["id"]))
+                self.items.append(e)
+
+    def _dump(self, e):
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def open_event(self, kind, note=""):
+        """开一条进行中的事件；同一 kind 已有未结的就直接返回它。"""
+        with self.lock:
+            for e in reversed(self.items):
+                if e.get("kind") == kind and not e.get("ended_at"):
+                    return e
+            self._seq += 1
+            e = {
+                "id": self._seq,
+                "kind": kind,                     # outage / stale
+                "started_at": time.time(),
+                "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "ended_at": None,
+                "ended": "",
+                "duration": 0,
+                "note": note,
+                "min_charge": None,
+                "max_elapsed": 0,
+                "end_reason": "",
+                "shutdown": False,
+            }
+            self.items.append(e)
+            if len(self.items) > self.cap:
+                del self.items[:len(self.items) - self.cap]
+        self._dump(e)
+        return e
+
+    def _rewrite(self):
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for x in self.items:
+                    f.write(json.dumps(x, ensure_ascii=False) + "\n")
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def touch(self, kind, charge=None, elapsed=None):
+        """刷新进行中事件的最大值（最低电量 / 最长已持续时间）。"""
+        with self.lock:
+            changed = None
+            for e in reversed(self.items):
+                if e.get("kind") == kind and not e.get("ended_at"):
+                    if charge is not None:
+                        mc = e.get("min_charge")
+                        if mc is None or charge < mc:
+                            e["min_charge"] = charge
+                            changed = e
+                    if elapsed is not None and elapsed > (e.get("max_elapsed") or 0):
+                        e["max_elapsed"] = int(elapsed)
+                        changed = e
+                    break
+        if changed:
+            self._rewrite()
+        return changed
+
+    def close_event(self, kind, end_reason="", shutdown=False):
+        with self.lock:
+            for e in reversed(self.items):
+                if e.get("kind") == kind and not e.get("ended_at"):
+                    now = time.time()
+                    e["ended_at"] = now
+                    e["ended"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    e["duration"] = int(now - float(e.get("started_at") or now))
+                    e["end_reason"] = end_reason
+                    e["shutdown"] = bool(shutdown)
+                    self._rewrite()
+                    return e
+        return None
+
+    def recent(self, n=50):
+        with self.lock:
+            return [dict(x) for x in self.items[-n:]][::-1]
+
+    def stats(self):
+        with self.lock:
+            items = list(self.items)
+        done = [e for e in items if e.get("ended_at")]
+        outages = [e for e in done if e.get("kind") == "outage"]
+        durs = [e.get("duration") or 0 for e in outages]
+        now = time.time()
+        last30 = [e for e in outages
+                  if now - float(e.get("started_at") or 0) <= 30 * 86400]
+        return {
+            "total": len(items),
+            "outages": len(outages),
+            "shutdowns": len([e for e in outages if e.get("shutdown")]),
+            "longest": max(durs) if durs else 0,
+            "avg": int(sum(durs) / len(durs)) if durs else 0,
+            "last30d": len(last30),
+            "open": [dict(e) for e in items if not e.get("ended_at")],
+        }
 
 
 class Ctx(dict):
@@ -538,6 +840,105 @@ class Ctx(dict):
 
     def __setattr__(self, k, v):
         self[k] = v
+
+
+PASSWORD_MASK = "********"
+
+
+PRIV_SOCK = ""          # 由 --priv-sock 传入；空则本进程自己干（root 直跑场景）
+PRIV_EXTRA_WAIT = 10
+
+
+def privileged(req):
+    """调用 root 助手；助手不可用时返回 None，由调用方决定回退还是放弃。"""
+    if not PRIV_SOCK:
+        return None
+    try:
+        timeout = int(req.get("timeout", 5)) + PRIV_EXTRA_WAIT
+    except (TypeError, ValueError):
+        timeout = PRIV_EXTRA_WAIT + 5
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(PRIV_SOCK)
+        sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        line = sock.makefile("r", encoding="utf-8").readline()
+        if not line:
+            return None
+        return json.loads(line)
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def run_ping(host, timeout=2):
+    """ping 一次。优先走 root 助手（降权后 ping 需要特权的场景），否则本地跑。"""
+    res = privileged({"cmd": "ping", "host": host, "timeout": timeout})
+    if res is not None:
+        return bool(res.get("ok")), res.get("error", "") or ""
+    cmd = ["ping", "-n", "-c", "1"]
+    cmd += (["-W", str(timeout * 1000)] if sys.platform == "darwin"
+            else ["-W", str(timeout)])
+    cmd.append(host)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+        return proc.returncode == 0, ""
+    except Exception as exc:
+        return False, str(exc)[:120]
+
+
+def hmac_compare(got, want):
+    """常量时间比较，避免用长度/前缀差异猜 token。"""
+    try:
+        return hmac.compare_digest((got or "").encode("utf-8"),
+                                   (want or "").encode("utf-8"))
+    except Exception:
+        return False
+
+
+def public_config(cfg):
+    """对外输出的配置：密码永不回传明文，只告诉调用方「有没有设过」。"""
+    out = json.loads(json.dumps(cfg))
+    up = out.get("upstream") or {}
+    if up.get("password"):
+        up["password"] = ""
+        up["password_set"] = True
+    else:
+        up["password_set"] = False
+    return out
+
+
+def merge_config(old, patch):
+    """把页面提交的配置合进当前配置。
+
+    页面拿不到原密码，所以 password 留空时保留旧值，避免用户只是改了个间隔
+    就把密码冲掉。
+    """
+    old_pwd = ((old.get("upstream") or {}).get("password")) or ""
+    patch = json.loads(json.dumps(patch or {}))
+    up = patch.get("upstream")
+    if isinstance(up, dict):
+        up.pop("password_set", None)
+        if not up.get("password"):
+            up["password"] = old_pwd
+    return deep_merge(old, patch)
+
+
+def is_loopback(addr):
+    try:
+        ip = ipaddress.ip_address((addr or "").split("%")[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return ip.is_loopback
 
 
 def make_handler(ctx):
@@ -563,10 +964,33 @@ def make_handler(ctx):
             self.end_headers()
             self.wfile.write(body)
 
+        def _deny(self):
+            return self._json({"ok": False, "error": "未授权"}, 401)
+
+        def _allowed(self):
+            """回环请求放行；非回环必须带正确 token。
+
+            fnOS 桌面网关在本机代理进来，来源恒为回环，所以默认场景无需 token。
+            绑 0.0.0.0 给局域网直连时，服务端会要求 token。
+            """
+            if is_loopback(self.client_address[0]):
+                return True
+            want = ((ctx.config.get("server") or {}).get("token") or "").strip()
+            if not want:
+                return False
+            got = (self.headers.get("X-Upsbridge-Token") or "").strip()
+            if not got:
+                auth = self.headers.get("Authorization") or ""
+                if auth.lower().startswith("bearer "):
+                    got = auth[7:].strip()
+            return hmac_compare(got, want)
+
         def do_GET(self):
             parsed = urlparse(self.path)
             p = parsed.path
             qs = parse_qs(parsed.query)
+            if not self._allowed():
+                return self._deny()
             if p in ("/", "/index.html"):
                 return self._text(PAGE)
             if p in ("/log", "/log/", "/log.html"):
@@ -585,10 +1009,11 @@ def make_handler(ctx):
                     "shutdown_issued": bool(st.get("shutdown_issued")),
                     "shutdown_reason": st.get("shutdown_reason", ""),
                     "lb_note": st.get("lb_note", ""),
+                    "witness": st.get("witness") or {},
                     "lb_confirm_seconds": int(time.time() - st["lb_since"]) if st.get("lb_since") else 0,
                 })
             if p == "/api/config":
-                return self._json(ctx.config)
+                return self._json(public_config(ctx.config))
             if p == "/api/log":
                 # 兼容老页面：lines 是纯文本，entries 是结构化数据
                 limit = int((qs.get("limit") or ["200"])[0] or 200)
@@ -603,6 +1028,10 @@ def make_handler(ctx):
                 items = ctx.log.since(seq, limit)
                 return self._json({"entries": items, "counts": ctx.log.counts(),
                                    "server_time": time.strftime("%Y-%m-%d %H:%M:%S")})
+            if p == "/api/events":
+                n = int((qs.get("limit") or ["50"])[0] or 50)
+                return self._json({"events": ctx.events.recent(n),
+                                   "stats": ctx.events.stats()})
             if p == "/api/logs/export":
                 body = ctx.log.export_text().encode("utf-8")
                 self.send_response(200)
@@ -616,6 +1045,8 @@ def make_handler(ctx):
             return self._text("not found", 404, "text/plain")
 
         def do_POST(self):
+            if not self._allowed():
+                return self._deny()
             p = self.path.split("?")[0]
             n = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(n) if n else b"{}"
@@ -643,7 +1074,7 @@ def make_handler(ctx):
                     return self._json({"ok": False, "error": str(e)})
 
             if p == "/api/config":
-                new = deep_merge(ctx.config, data)
+                new = merge_config(ctx.config, data)
                 ctx.config.clear()
                 ctx.config.update(new)
                 try:
@@ -652,6 +1083,19 @@ def make_handler(ctx):
                 except Exception as e:
                     return self._json({"ok": False, "error": "写入失败：" + str(e)}, 500)
                 ctx.log.add("配置已保存", "ok")
+                return self._json({"ok": True})
+
+            if p == "/api/notify/test":
+                url = ((data.get("notify") or {}).get("webhook_url")
+                       or (ctx.config.get("notify") or {}).get("webhook_url") or "")
+                if not url.strip():
+                    return self._json({"ok": False, "error": "还没填通知地址"}, 400)
+                if ctx.notifier:
+                    sent = ctx.notifier.send("test", "测试通知",
+                                             "如果你看到这条，说明地址填对了", "info")
+                    if not sent:
+                        return self._json({"ok": False,
+                                           "error": "发送被跳过，请检查地址格式"}, 400)
                 return self._json({"ok": True})
 
             if p == "/api/logs/clear":
@@ -1178,7 +1622,7 @@ PAGE = r"""<!DOCTYPE html>
       <div><label>端口</label><input id="port" type="number" value="3493"></div>
       <div><label>UPS 名称</label><input id="upsname" type="text" placeholder="upsname（见下表）"></div>
       <div><label>账号</label><input id="username" type="text" placeholder="见下表"></div>
-      <div><label>密码</label><input id="password" type="password" placeholder="见下表"></div>
+      <div><label>密码</label><input id="password" type="password" placeholder="留空表示不修改" autocomplete="new-password"></div>
     </div>
     <div class="hint">
       各家 NUT Server 的默认标识（以自己设备上实际配置为准，可用 <code>upsc -l &lt;主机&gt;</code> 查）：
@@ -1188,6 +1632,7 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div style="margin-top:12px">
       <button class="ghost" id="btnTest">测试连接</button>
+      <button class="ghost" id="btnNotifyTest">测试通知</button>
       <span class="msg" id="testMsg"></span>
     </div>
   </div>
@@ -1203,8 +1648,11 @@ PAGE = r"""<!DOCTYPE html>
       <div><label>电量低于此值时视为低电量（0 = 不启用）</label><input id="rule_charge" type="number" value="0"></div>
       <div><label>通信中断判定秒数（中断不触发关机）</label><input id="rule_dead" type="number" value="30"></div>
       <div><label>轮询间隔（秒）</label><input id="rule_poll" type="number" value="5"></div>
-      <div><label>关机命令</label><input id="rule_cmd" type="text" value="/sbin/shutdown -h +0"></div>
+      <div><label>关机命令</label><input id="rule_cmd" type="text" placeholder="关机命令，留空则用平台默认"></div>
+      <div><label>旁路验证设备（可留空）</label><input id="rule_witness" type="text" placeholder="和市电同生共死的设备，例如路由器 IP"></div>
+      <div><label>通知 Webhook 地址（可留空）</label><input id="notify_url" type="text" placeholder="https://…，会收到 JSON POST"></div>
     </div>
+    <div class="hint">旁路验证：上游 NUT 连不上时，ping 这台设备来判断是网络问题还是真断电。选一台挂了就没有 UPS 保护的设备（路由器、交换机），不要选带电池的。</div>
     <div class="hint" id="dryHint"></div>
   </div>
 
@@ -1267,7 +1715,8 @@ function tick(){
 function fill(c){
   q('host').value = c.upstream.host; q('port').value = c.upstream.port;
   q('upsname').value = c.upstream.upsname; q('username').value = c.upstream.username;
-  q('password').value = c.upstream.password;
+  q('password').value = '';
+  q('password').placeholder = c.upstream.password_set ? '已设置，留空表示不修改' : '留空表示不修改';
   q('rule_secs').value = c.rules.shutdown_on_battery_seconds;
   q('rule_lb').checked = !!c.rules.shutdown_on_lowbattery;
   q('rule_fsd').checked = !!c.rules.shutdown_on_fsd;
@@ -1276,6 +1725,8 @@ function fill(c){
   q('rule_dead').value = c.rules.deadtime;
   q('rule_poll').value = c.rules.poll_interval;
   q('rule_cmd').value = c.rules.shutdown_cmd;
+  q('rule_witness').value = c.rules.witness_host || '';
+  q('notify_url').value = (c.notify && c.notify.webhook_url) || '';
   q('rule_dry').checked = !!c.rules.dry_run;
   q('dryHint').textContent = c.rules.dry_run ? '当前为演练模式，满足条件时只记日志。' : '⚠️ 演练模式已关闭，满足条件会真的关机。';
 }
@@ -1291,7 +1742,9 @@ function collect(){
       battery_charge_low_override:Number(q('rule_charge').value)||0,
       deadtime:Number(q('rule_dead').value)||30,
       poll_interval:Number(q('rule_poll').value)||5,
-      shutdown_cmd:q('rule_cmd').value, dry_run:q('rule_dry').checked }
+      shutdown_cmd:q('rule_cmd').value, dry_run:q('rule_dry').checked,
+      witness_host:q('rule_witness').value.trim() },
+    notify: { webhook_url:q('notify_url').value.trim() }
   };
 }
 
@@ -1309,6 +1762,17 @@ q('btnTest').onclick = function(){
       q('testMsg').textContent = '失败：' + d.error; q('testMsg').style.color = 'var(--bad)';
     }
   }).catch(function(e){ q('testMsg').textContent = '请求失败'; });
+};
+
+q('btnNotifyTest').onclick = function(){
+  q('testMsg').textContent = '发送中…'; q('testMsg').style.color = 'var(--dim)';
+  fetch('/api/notify/test', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(collect())})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    q('testMsg').textContent = d.ok ? '已发出，去你的接收端看看' : ('失败：' + d.error);
+    q('testMsg').style.color = d.ok ? 'var(--ok)' : 'var(--bad)';
+  }).catch(function(){ q('testMsg').textContent = '请求失败'; });
 };
 
 q('btnSave').onclick = function(){
@@ -1338,24 +1802,57 @@ tick(); setInterval(tick, 2000);
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
+    ap.add_argument("--config", default=None,
+                    help="配置文件路径；不给时 Windows 用 %APPDATA%\\upsbridge\\config.json，"
+                         "其他平台必填（fnOS 生命周期脚本总是显式传入）")
     ap.add_argument("--port", type=int, default=28190)
     ap.add_argument("--log", default=None)
+    ap.add_argument("--priv-sock", default="",
+                    help="root 特权助手 socket；给了就把关机与 ping 交给它")
     a = ap.parse_args()
+
+    cfg_path = a.config
+    if cfg_path is None:
+        if not IS_WINDOWS:
+            ap.error("--config is required on this platform")
+        cfg_path = os.path.join(
+            os.environ.get("APPDATA") or os.path.expanduser("~"),
+            "upsbridge", "config.json")
+    cfg_path = os.path.abspath(cfg_path)
+    conf_dir = os.path.dirname(cfg_path)
+    try:
+        os.makedirs(conf_dir, exist_ok=True)
+    except OSError:
+        pass
 
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     try:
-        with open(a.config, encoding="utf-8") as f:
+        with open(cfg_path, encoding="utf-8") as f:
             cfg = deep_merge(cfg, json.load(f))
     except Exception:
         pass
 
+    global PRIV_SOCK
+    PRIV_SOCK = (a.priv_sock or "").strip()
+
     ctx = Ctx()
     ctx.config = cfg
-    ctx.conf_path = a.config
+    ctx.conf_path = cfg_path
     ctx.state = {"failures": 0, "mode": "INIT", "ob_since": None, "stale": False}
-    here = os.path.dirname(os.path.abspath(a.config))
-    ctx.log = Log(a.log or (here + "/../var/log/app.log"))
+    if a.log:
+        log_path = a.log
+    elif IS_WINDOWS:
+        log_path = os.path.join(conf_dir, "upsbridge.log")
+    else:
+        log_path = os.path.join(conf_dir, os.pardir, "var", "log", "app.log")
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+    except OSError:
+        pass
+    ctx.log = Log(log_path)
+    ev_path = os.path.join(os.path.dirname(os.path.abspath(log_path)), "events.jsonl")
+    ctx.events = Events(ev_path)
+    ctx.notifier = Notifier(ctx.log, lambda: ctx.config)
     ctx.stop = threading.Event()
     up0 = cfg["upstream"]
     ctx.log.add("upsbridge %s 启动，上游 %s:%s，UPS 名 %s" % (
@@ -1367,8 +1864,17 @@ def main():
 
     Monitor(ctx).start()
 
-    srv = ThreadingHTTPServer(("0.0.0.0", a.port), make_handler(ctx))
-    ctx.log.add("管理界面已启动，端口 %d" % a.port, "ok")
+    bind = (cfg.get("server") or {}).get("bind") or "127.0.0.1"
+    token = ((cfg.get("server") or {}).get("token") or "").strip()
+    if not is_loopback(bind) and not token:
+        ctx.log.add("监听地址 %s 不是回环，但没配访问令牌：非本机请求会被拒绝。"
+                    "请在 server.token 里设一个令牌" % bind, "warn")
+    try:
+        srv = ThreadingHTTPServer((bind, a.port), make_handler(ctx))
+    except OSError as e:
+        ctx.log.add("绑定 %s:%d 失败：%s" % (bind, a.port, e), "error")
+        raise
+    ctx.log.add("管理界面已启动，监听 %s:%d" % (bind, a.port), "ok")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
