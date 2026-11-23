@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # 平台感知：Windows 与 Linux 的默认关机命令不同；
 # 容器里可用环境变量 UPSBRIDGE_SHUTDOWN_CMD 覆盖（Docker 版靠它指向宿主机关机）。
@@ -34,8 +34,13 @@ DEFAULT_CONFIG = {
         "deadtime": 30,
         "poll_interval": 5,
         "shutdown_cmd": DEFAULT_SHUTDOWN_CMD,
-        # 旁路验证：上游 NUT 失联时，ping 一台「和市电同生共死」的设备来判断
-        # 到底是网络问题还是真断电。留空则不启用，行为与以前完全一致。
+        # 失联兜底：NUT 服务器自己也在 UPS 上，真断电时它会靠电池继续跑，
+        # NUT 反而不会断。所以「失联」通常意味着网络/那台 NAS 出问题，而不是断电。
+        # 但这台机器可能正靠 UPS 电池硬撑，撑到电池耗尽就是硬断电。
+        # 因此允许「失联满 N 秒就关机」，0 = 不启用（默认，保持老行为）。
+        "shutdown_when_stale_seconds": 0,
+        # 旁路验证：ping 一台市电侧设备，用来提供交叉证据。
+        # 注意它不是「NUT 是否可达」的替代 —— 那个信息 NUT 本身已经给了。
         "witness_host": "",
         "witness_timeout": 2,
         "witness_on_stale": True,
@@ -348,6 +353,7 @@ class Monitor(threading.Thread):
                 if st.get("stale"):
                     log.add("与上游 " + (up.get("host") or "") + " 恢复通信", "ok")
                 st["stale"] = False
+                st["stale_since"] = None
                 self.update_state(variables, fsd, cfg, st, log)
             except Exception as e:
                 st["failures"] = st.get("failures", 0) + 1
@@ -356,49 +362,102 @@ class Monitor(threading.Thread):
                 st["last_error"] = str(e)
                 if st["failures"] * interval >= deadtime and not st.get("stale"):
                     st["stale"] = True
-                    log.add("与上游失联超过 %ds（%s），不会因此关机" % (deadtime, e), "warn")
+                    st["stale_since"] = time.time()
+                    log.add("与上游失联超过 %ds（%s）" % (deadtime, e), "warn")
                     self.note_witness(cfg, st, log)
                     if self.notifier:
                         w = st.get("witness") or {}
                         extra = ""
                         if w.get("ok") is True:
-                            extra = "；旁路设备 %s 仍通，多半是网络问题" % w.get("host")
+                            extra = "；旁路设备 %s 仍通，市电侧还活着" % w.get("host")
                         elif w.get("ok") is False:
-                            extra = "；旁路设备 %s 也不通，可能真断电" % w.get("host")
+                            extra = "；旁路设备 %s 也不通，市电侧可能真的没了" % w.get("host")
                         self.notifier.send("stale", "与 UPS 上游失联",
                                            "%s%s" % (e, extra), "warn")
+                self.check_stale_shutdown(cfg, st, log)
                 time.sleep(min(interval, 3))
                 continue
             time.sleep(interval)
 
-    def note_witness(self, cfg, st, log):
-        """上游刚判失联时做一次旁路验证，把「网络问题」和「真断电」分开。"""
+    def check_stale_shutdown(self, cfg, st, log):
+        """失联持续超过阈值就关机。
+
+        NUT 服务器接在 UPS 上，真断电时它靠电池继续跑，NUT 不会断；一旦断了，
+        基本是网络或那台 NAS 出事。但这台机器此刻可能正靠 UPS 电池硬撑，
+        而我们已经看不见电量了 —— 撑到电池耗尽是硬断电。所以允许设一个上限：
+        失联够久就主动软关机，别赌。
+        """
         rules = cfg["rules"]
-        if not rules.get("witness_on_stale", True):
+        try:
+            limit = int(rules.get("shutdown_when_stale_seconds") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0:
             return
-        host = (rules.get("witness_host") or "").strip()
-        if not host:
+        since = st.get("stale_since")
+        if not since:
             return
-        ok = self.probe_witness(cfg, st)
-        if ok is None:
-            log.add("旁路验证 %s 不可用，无法区分是网络故障还是断电" % host, "warn")
-        elif ok:
-            log.add("旁路验证 %s 仍然通，说明是网络或上游服务的问题，不是断电" % host, "ok")
-        else:
-            log.add("旁路验证 %s 也 ping 不通，外部设备同样断电的可能性较大" % host, "warn")
+        if st.get("shutdown_issued"):
+            return
+        elapsed = int(time.time() - since)
+        if elapsed < limit:
+            return
+        self.trigger_shutdown(
+            "与上游失联已 %ds（阈值 %ds），本机电池余量未知" % (elapsed, limit),
+            cfg, st, log)
 
-    def probe_witness(self, cfg, st):
-        """ping 旁路设备，返回 True/False/None（None=不可用或没配置）。
+    def witness_allowed(self, cfg):
+        """旁路目标不能就是 NUT 服务器本身。
 
-        用途只有一个：上游失联时区分「我们连不上 UPS」和「真的停电了」。
-        它只写日志、提供交叉证据，绝不单独触发关机 —— 因为 ping 不通的原因
-        太多（目标机重启、VLAN 变更、防火墙改规则），拿它当真值太脆弱。
+        NUT 服务器就装在接了 UPS 的那台机器上。拿它的地址去 ping，
+        等于用「能不能连通它」去证明「它还在不在」—— 循环论证，永远为真，
+        而且它本来就在 UPS 上，断电时照样活得好好的。
         """
         rules = cfg["rules"]
         host = (rules.get("witness_host") or "").strip()
         if not host:
-            return None
-        if not re.match(r"^[A-Za-z0-9._:-]+$", host) or host.startswith("-"):
+            return None, "没配置"
+        nut_host = (cfg.get("upstream") or {}).get("host") or ""
+        nut_host = nut_host.strip()
+        if nut_host and host.lower() == nut_host.lower():
+            return None, "和 NUT 服务器是同一台"
+        return host, ""
+
+    def note_witness(self, cfg, st, log):
+        """上游失联时探测旁路设备，给出与 NUT 无关的第二意见。
+
+        要知道它回答的到底是什么问题：
+          NUT 断开  ≠  断电。NUT 服务器自己接在 UPS 上，真断电时它靠电池
+          还能跑很久，NUT 根本不会断。所以失联更可能是网络或那台 NAS 的问题。
+          这时如果一台「没接 UPS」的设备也 ping 不通，才说明市电侧真的没了。
+        """
+        rules = cfg["rules"]
+        if not rules.get("witness_on_stale", True):
+            return
+        host, why = self.witness_allowed(cfg)
+        if host is None:
+            if why and why != "没配置":
+                log.add("旁路验证已跳过：%s，换成另一台设备（例如路由器）才有意义" % why, "warn")
+            return
+        ok = self.probe_witness(cfg, st)
+        if ok is None:
+            log.add("旁路验证 %s 探测失败，这次没法交叉判断" % host, "warn")
+        elif ok:
+            log.add("旁路验证 %s 仍然通，市电侧还活着，问题在本机到 NUT 服务器这一段" % host, "ok")
+        else:
+            log.add("旁路验证 %s 也 ping 不通，市电侧可能真的没了，注意本机电池余量" % host, "warn")
+
+    def probe_witness(self, cfg, st):
+        """ping 旁路设备，返回 True/False/None（None=不可用或没配置）。
+
+        它的价值在于「与 NUT 无关」：NUT 断不代表断电，但一台没接 UPS 的
+        设备也 ping 不通，就是市电侧真的出事的独立证据。
+        仍不单独触发关机 —— ping 不通的原因太多（目标机重启、VLAN 变更、
+        防火墙改规则），拿它当真值太脆弱。
+        """
+        rules = cfg["rules"]
+        host, why = self.witness_allowed(cfg)
+        if host is None:
             return None
         try:
             timeout = int(rules.get("witness_timeout") or 2)
@@ -1005,6 +1064,7 @@ def make_handler(ctx):
                     "reason": st.get("reason", ""),
                     "on_battery_seconds": int(time.time() - st["ob_since"]) if st.get("ob_since") else 0,
                     "stale": bool(st.get("stale")),
+                    "stale_seconds": int(time.time() - st["stale_since"]) if st.get("stale_since") else 0,
                     "last_error": st.get("last_error", ""),
                     "shutdown_issued": bool(st.get("shutdown_issued")),
                     "shutdown_reason": st.get("shutdown_reason", ""),
@@ -1649,10 +1709,12 @@ PAGE = r"""<!DOCTYPE html>
       <div><label>通信中断判定秒数（中断不触发关机）</label><input id="rule_dead" type="number" value="30"></div>
       <div><label>轮询间隔（秒）</label><input id="rule_poll" type="number" value="5"></div>
       <div><label>关机命令</label><input id="rule_cmd" type="text" placeholder="关机命令，留空则用平台默认"></div>
-      <div><label>旁路验证设备（可留空）</label><input id="rule_witness" type="text" placeholder="和市电同生共死的设备，例如路由器 IP"></div>
+      <div><label>失联多久后关机（0 = 不启用）</label><input id="rule_staleshut" type="number" value="0"></div>
+      <div><label>旁路验证设备（可留空）</label><input id="rule_witness" type="text" placeholder="没接 UPS 的设备，例如路由器 IP"></div>
       <div><label>通知 Webhook 地址（可留空）</label><input id="notify_url" type="text" placeholder="https://…，会收到 JSON POST"></div>
     </div>
-    <div class="hint">旁路验证：上游 NUT 连不上时，ping 这台设备来判断是网络问题还是真断电。选一台挂了就没有 UPS 保护的设备（路由器、交换机），不要选带电池的。</div>
+    <div class="hint">失联兜底：NUT 服务器自己也在 UPS 上，真断电时它靠电池还能跑，NUT 反而不会断；一旦失联，多半是网络或那台 NAS 的问题。但本机可能正靠电池硬撑，看不见电量。设一个上限，失联够久就主动软关机，别赌电池余量。</div>
+    <div class="hint">旁路验证：填一台<strong>没接 UPS</strong> 的设备（路由器、交换机），不要填 NUT 服务器本身——它就在 UPS 上，拿它判断等于用自己证明自己。它只提供第二意见，不会单独触发关机。</div>
     <div class="hint" id="dryHint"></div>
   </div>
 
@@ -1726,6 +1788,7 @@ function fill(c){
   q('rule_poll').value = c.rules.poll_interval;
   q('rule_cmd').value = c.rules.shutdown_cmd;
   q('rule_witness').value = c.rules.witness_host || '';
+  q('rule_staleshut').value = c.rules.shutdown_when_stale_seconds || 0;
   q('notify_url').value = (c.notify && c.notify.webhook_url) || '';
   q('rule_dry').checked = !!c.rules.dry_run;
   q('dryHint').textContent = c.rules.dry_run ? '当前为演练模式，满足条件时只记日志。' : '⚠️ 演练模式已关闭，满足条件会真的关机。';
@@ -1743,7 +1806,8 @@ function collect(){
       deadtime:Number(q('rule_dead').value)||30,
       poll_interval:Number(q('rule_poll').value)||5,
       shutdown_cmd:q('rule_cmd').value, dry_run:q('rule_dry').checked,
-      witness_host:q('rule_witness').value.trim() },
+      witness_host:q('rule_witness').value.trim(),
+      shutdown_when_stale_seconds:Number(q('rule_staleshut').value)||0 },
     notify: { webhook_url:q('notify_url').value.trim() }
   };
 }
