@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 # 平台感知：Windows 与 Linux 的默认关机命令不同；
 # 容器里可用环境变量 UPSBRIDGE_SHUTDOWN_CMD 覆盖（Docker 版靠它指向宿主机关机）。
@@ -39,11 +39,10 @@ DEFAULT_CONFIG = {
         # 但这台机器可能正靠 UPS 电池硬撑，撑到电池耗尽就是硬断电。
         # 因此允许「失联满 N 秒就关机」，0 = 不启用（默认，保持老行为）。
         "shutdown_when_stale_seconds": 0,
-        # 旁路验证：ping 一台市电侧设备，用来提供交叉证据。
-        # 注意它不是「NUT 是否可达」的替代 —— 那个信息 NUT 本身已经给了。
+        # 诊断用：手动点「诊断」时顺带 ping 这台设备（应当是一台没接 UPS 的机器）。
+        # 不做自动探测 —— NUT 断不断和市电有没有，本就是两回事，见 README。
         "witness_host": "",
         "witness_timeout": 2,
-        "witness_on_stale": True,
     },
     # 监听与鉴权：默认只绑回环，fnOS 桌面网关在本机代理进来就能用；
     # 要局域网直连必须显式改 bind，并配 token（否则 API 拒绝非回环请求）。
@@ -364,16 +363,8 @@ class Monitor(threading.Thread):
                     st["stale"] = True
                     st["stale_since"] = time.time()
                     log.add("与上游失联超过 %ds（%s）" % (deadtime, e), "warn")
-                    self.note_witness(cfg, st, log)
                     if self.notifier:
-                        w = st.get("witness") or {}
-                        extra = ""
-                        if w.get("ok") is True:
-                            extra = "；旁路设备 %s 仍通，市电侧还活着" % w.get("host")
-                        elif w.get("ok") is False:
-                            extra = "；旁路设备 %s 也不通，市电侧可能真的没了" % w.get("host")
-                        self.notifier.send("stale", "与 UPS 上游失联",
-                                           "%s%s" % (e, extra), "warn")
+                        self.notifier.send("stale", "与 UPS 上游失联", str(e), "warn")
                 self.check_stale_shutdown(cfg, st, log)
                 time.sleep(min(interval, 3))
                 continue
@@ -423,54 +414,104 @@ class Monitor(threading.Thread):
             return None, "和 NUT 服务器是同一台"
         return host, ""
 
-    def note_witness(self, cfg, st, log):
-        """上游失联时探测旁路设备，给出与 NUT 无关的第二意见。
+    def witness_target(self, cfg):
+        """诊断用的旁路目标；不能是 NUT 服务器本身。
 
-        要知道它回答的到底是什么问题：
-          NUT 断开  ≠  断电。NUT 服务器自己接在 UPS 上，真断电时它靠电池
-          还能跑很久，NUT 根本不会断。所以失联更可能是网络或那台 NAS 的问题。
-          这时如果一台「没接 UPS」的设备也 ping 不通，才说明市电侧真的没了。
+        NUT 服务器就装在那台接了 UPS 的机器上。拿它的地址去 ping，
+        等于用「能不能连通它」证明「它还在不在」—— 循环论证，而且它一直在。
         """
         rules = cfg["rules"]
-        if not rules.get("witness_on_stale", True):
-            return
-        host, why = self.witness_allowed(cfg)
-        if host is None:
-            if why and why != "没配置":
-                log.add("旁路验证已跳过：%s，换成另一台设备（例如路由器）才有意义" % why, "warn")
-            return
-        ok = self.probe_witness(cfg, st)
-        if ok is None:
-            log.add("旁路验证 %s 探测失败，这次没法交叉判断" % host, "warn")
-        elif ok:
-            log.add("旁路验证 %s 仍然通，市电侧还活着，问题在本机到 NUT 服务器这一段" % host, "ok")
-        else:
-            log.add("旁路验证 %s 也 ping 不通，市电侧可能真的没了，注意本机电池余量" % host, "warn")
+        host = (rules.get("witness_host") or "").strip()
+        if not host:
+            return None, "没填"
+        nut_host = ((cfg.get("upstream") or {}).get("host") or "").strip()
+        if nut_host and host.lower() == nut_host.lower():
+            return None, "这和 NUT 服务器是同一台，换一台没接 UPS 的设备"
+        return host, ""
 
-    def probe_witness(self, cfg, st):
-        """ping 旁路设备，返回 True/False/None（None=不可用或没配置）。
-
-        它的价值在于「与 NUT 无关」：NUT 断不代表断电，但一台没接 UPS 的
-        设备也 ping 不通，就是市电侧真的出事的独立证据。
-        仍不单独触发关机 —— ping 不通的原因太多（目标机重启、VLAN 变更、
-        防火墙改规则），拿它当真值太脆弱。
-        """
+    def ping_witness(self, cfg):
+        """ping 诊断目标，返回 (host, ok, err)。ok=None 表示没配或配置不可用。"""
         rules = cfg["rules"]
-        host, why = self.witness_allowed(cfg)
+        host, why = self.witness_target(cfg)
         if host is None:
-            return None
+            return None, None, why
         try:
             timeout = int(rules.get("witness_timeout") or 2)
         except (TypeError, ValueError):
             timeout = 2
         timeout = max(1, min(10, timeout))
-        ok, _err = run_ping(host, timeout)
-        st["witness"] = {
-            "host": host,
-            "ok": ok,
+        ok, err = run_ping(host, timeout)
+        return host, ok, err
+
+    def diagnose(self, cfg, st, log):
+        """手动诊断：把「上游通不通」和「市电侧在不在」一次问清楚。
+
+        这两件事经常被混为一谈：NUT 服务器自己也接在 UPS 上，断电时它靠电池
+        继续跑，NUT 照样通。所以诊断要分开看：
+          - 上游 NUT 可达 → 说明那台机器和网络都正常
+          - 上游不可达 + 旁路设备可达 → 问题在本机到 NUT 这一段
+          - 上游不可达 + 旁路设备也不可达 → 市电侧可能真的没了
+        """
+        up = cfg.get("upstream") or {}
+        result = {
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "upstream": {"host": up.get("host") or "", "ok": False, "error": "", "vars": {}},
+            "witness": {"host": "", "ok": None, "error": ""},
+            "verdict": "",
+            "advice": "",
         }
-        return ok
+
+        # 1) 上游连通性
+        if not (up.get("host") or "").strip():
+            result["upstream"]["error"] = "还没配置上游地址"
+        else:
+            client = NutClient({}, log)
+            try:
+                client.connect(up)
+                variables, fsd = client.poll(up)
+                result["upstream"]["ok"] = True
+                result["upstream"]["vars"] = {
+                    "status": variables.get("ups.status", ""),
+                    "charge": variables.get("battery.charge", ""),
+                    "runtime": variables.get("battery.runtime", ""),
+                    "model": (variables.get("device.mfr", "") + " "
+                              + variables.get("device.model", "")).strip(),
+                    "fsd": bool(fsd),
+                }
+            except Exception as exc:
+                result["upstream"]["error"] = str(exc)[:160]
+            finally:
+                client.close()
+
+        # 2) 旁路设备
+        host, ok, err = self.ping_witness(cfg)
+        result["witness"] = {"host": host or "", "ok": ok, "error": err or ""}
+        if host:
+            st["witness"] = {"host": host, "ok": ok,
+                             "at": result["at"]}
+
+        # 3) 结论
+        up_ok = result["upstream"]["ok"]
+        w_ok = result["witness"]["ok"]
+        if up_ok:
+            result["verdict"] = "上游正常"
+            result["advice"] = "NUT 通信正常，看状态卡里的 ups.status 判断是否在用电池"
+        elif w_ok is True:
+            result["verdict"] = "上游不可达，市电侧仍在"
+            result["advice"] = "旁路设备还能 ping 通，说明市电正常；问题在本机到 NUT 服务器这一段"
+        elif w_ok is False:
+            result["verdict"] = "上游不可达，市电侧也不可达"
+            result["advice"] = "两边都不通，市电侧可能真的断了；注意本机还有多少电池"
+        else:
+            result["verdict"] = "上游不可达"
+            result["advice"] = "本机到 NUT 服务器这段有问题；要分清是不是断电，填一台没接 UPS 的设备再诊断"
+
+        log.add("手动诊断：%s（上游 %s，旁路 %s）"
+                % (result["verdict"],
+                   "通" if up_ok else "不通",
+                   ("通" if w_ok else "不通") if w_ok is not None else "未测"),
+                "ok" if up_ok else "warn")
+        return result
 
     def confirm_low_battery(self, raw, on_batt, charge, runtime,
                             charge_low_up, runtime_low, rules, st, log, now):
@@ -1145,6 +1186,16 @@ def make_handler(ctx):
                 ctx.log.add("配置已保存", "ok")
                 return self._json({"ok": True})
 
+            if p == "/api/diagnose":
+                monitor = ctx.get("monitor")
+                if monitor is None:
+                    return self._json({"ok": False, "error": "监控线程未就绪"}, 503)
+                try:
+                    res = monitor.diagnose(ctx.config, ctx.state, ctx.log)
+                    return self._json({"ok": True, "result": res})
+                except Exception as exc:
+                    return self._json({"ok": False, "error": str(exc)[:200]}, 500)
+
             if p == "/api/notify/test":
                 url = ((data.get("notify") or {}).get("webhook_url")
                        or (ctx.config.get("notify") or {}).get("webhook_url") or "")
@@ -1710,11 +1761,10 @@ PAGE = r"""<!DOCTYPE html>
       <div><label>轮询间隔（秒）</label><input id="rule_poll" type="number" value="5"></div>
       <div><label>关机命令</label><input id="rule_cmd" type="text" placeholder="关机命令，留空则用平台默认"></div>
       <div><label>失联多久后关机（0 = 不启用）</label><input id="rule_staleshut" type="number" value="0"></div>
-      <div><label>旁路验证设备（可留空）</label><input id="rule_witness" type="text" placeholder="没接 UPS 的设备，例如路由器 IP"></div>
       <div><label>通知 Webhook 地址（可留空）</label><input id="notify_url" type="text" placeholder="https://…，会收到 JSON POST"></div>
     </div>
     <div class="hint">失联兜底：NUT 服务器自己也在 UPS 上，真断电时它靠电池还能跑，NUT 反而不会断；一旦失联，多半是网络或那台 NAS 的问题。但本机可能正靠电池硬撑，看不见电量。设一个上限，失联够久就主动软关机，别赌电池余量。</div>
-    <div class="hint">旁路验证：填一台<strong>没接 UPS</strong> 的设备（路由器、交换机），不要填 NUT 服务器本身——它就在 UPS 上，拿它判断等于用自己证明自己。它只提供第二意见，不会单独触发关机。</div>
+    <div class="hint">诊断用的旁路设备在下面「诊断」卡片里填，平时不参与任何判断。</div>
     <div class="hint" id="dryHint"></div>
   </div>
 
@@ -1727,6 +1777,18 @@ PAGE = r"""<!DOCTYPE html>
     <button id="btnSave">保存配置</button>
     <button class="ghost" id="btnReset">复位触发标记</button>
     <span class="msg" id="saveMsg"></span>
+  </div>
+
+  <div class="card">
+    <div class="k" style="margin-bottom:10px">诊断</div>
+    <label>旁路设备（可留空，建议填一台没接 UPS 的机器，比如路由器）</label>
+    <input id="rule_witness" type="text" placeholder="192.168.1.1" autocomplete="off">
+    <div class="hint">NUT 服务器自己也接在 UPS 上，断电时它靠电池照样能通信。所以「连不上 NUT」和「断电了」是两件事，这里把两者分开问一次。不要填 NUT 服务器本身的地址。</div>
+    <div style="margin-top:12px">
+      <button class="ghost" id="btnDiagnose">开始诊断</button>
+      <span class="msg" id="diagMsg"></span>
+    </div>
+    <div id="diagOut" style="display:none;margin-top:12px"></div>
   </div>
 
   <div class="card" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -1828,6 +1890,50 @@ q('btnTest').onclick = function(){
   }).catch(function(e){ q('testMsg').textContent = '请求失败'; });
 };
 
+q('btnDiagnose').onclick = function(){
+  var btn = q('btnDiagnose');
+  btn.disabled = true;
+  q('diagMsg').textContent = '诊断中…'; q('diagMsg').style.color = 'var(--dim)';
+  // 先把旁路地址写进配置，免得用户填了却没保存就去点诊断
+  var save = fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({rules:{witness_host:q('rule_witness').value.trim()}})})
+    .catch(function(){ return null; });
+  save.then(function(){
+    return fetch('/api/diagnose', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (!d.ok) {
+      q('diagMsg').textContent = '诊断失败：' + (d.error || '未知错误');
+      q('diagMsg').style.color = 'var(--bad)';
+      return;
+    }
+    var r2 = d.result, up = r2.upstream, w = r2.witness;
+    var okCls = r2.upstream.ok ? 'b-ok' : 'b-warn';
+    function row(k, v) { return '<div class="stat"><div class="k">' + k + '</div><div class="v" style="font-size:15px">' + v + '</div></div>'; }
+    var vars = up.vars || {};
+    var html = '<div class="row" style="margin-bottom:12px">'
+      + row('上游 NUT', up.ok ? '<span class="badge b-ok">可达</span>' : '<span class="badge b-bad">不可达</span>')
+      + row('旁路设备', w.ok === true ? '<span class="badge b-ok">通</span>'
+              : (w.ok === false ? '<span class="badge b-bad">不通</span>' : '<span class="badge b-dim">未测</span>'))
+      + '</div>'
+      + '<div class="hint" style="margin:0 0 8px"><strong>' + r2.verdict + '</strong> · ' + r2.advice + '</div>';
+    if (up.ok) {
+      html += '<div class="hint">' + (vars.model || '') + ' · ' + (vars.status || '')
+           + ' · 电量 ' + (vars.charge || '?') + '%'
+           + (vars.runtime ? ' · 续航 ' + vars.runtime + 's' : '')
+           + (vars.fsd ? ' · FSD 已置位' : '') + '</div>';
+    } else if (up.error) {
+      html += '<div class="hint">上游错误：' + up.error + '</div>';
+    }
+    if (w.host && w.error) html += '<div class="hint">旁路 ' + w.host + '：' + w.error + '</div>';
+    if (w.host === '') html += '<div class="hint">没填旁路设备，只能判断上游通不通，分不出是不是断电。</div>';
+    var out = q('diagOut');
+    out.innerHTML = html; out.style.display = '';
+    q('diagMsg').textContent = '';
+  }).catch(function(e){
+    q('diagMsg').textContent = '请求失败'; q('diagMsg').style.color = 'var(--bad)';
+  }).then(function(){ btn.disabled = false; });
+};
+
 q('btnNotifyTest').onclick = function(){
   q('testMsg').textContent = '发送中…'; q('testMsg').style.color = 'var(--dim)';
   fetch('/api/notify/test', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -1926,7 +2032,9 @@ def main():
     if cfg["rules"].get("dry_run", True):
         ctx.log.add("演练模式已开启：满足关机条件时只记录，不真正执行", "warn")
 
-    Monitor(ctx).start()
+    monitor = Monitor(ctx)
+    ctx.monitor = monitor
+    monitor.start()
 
     bind = (cfg.get("server") or {}).get("bind") or "127.0.0.1"
     token = ((cfg.get("server") or {}).get("token") or "").strip()
