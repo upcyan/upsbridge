@@ -7,14 +7,13 @@
       "control": {
         "accessPerm": "editable"
       },
-      "protocol": "http",
-      "gatewayPrefix": "",
-      "gatewaySocket": "",
+      "protocol": "",
+      "gatewayPrefix": "/app/upsbridge",
+      "gatewaySocket": "upsbridge.sock",
       "title": "UPS 断电联动",
       "icon": "images/logo_{0}.png",
       "type": "iframe",
-      "port": "28190",
-      "url": "/"
+      "url": "/app/upsbridge/"
     }
   }
 }

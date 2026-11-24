@@ -195,6 +195,7 @@ do_start() {
   if [ "$use_drop" = "1" ]; then
     setsid setpriv --reuid "$(app_uid)" --regid "$(app_gid)" --init-groups \
         "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" "${priv_args[@]}" \
+        --gateway-sock "$GATEWAY_SOCK" "${priv_args[@]}" \
         < /dev/null >> "$LOG/stdout.log" 2>&1 &
   elif command -v setsid >/dev/null 2>&1; then
     setsid "$PY" "$APP" --config "$CONF" --port "$PORT" --log "$LOG/app.log" \

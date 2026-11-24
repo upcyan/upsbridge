@@ -1,3 +1,45 @@
+## upsbridge 1.4.0
+
+桌面入口从端口 iframe 迁到同源网关。
+
+### 原来的问题
+
+`ui/config` 用 `protocol: http + port: 28190` 让桌面直接开 `http://NAS:28190`。三个后果：
+
+1. 1.3.0 起服务默认只听 `127.0.0.1`，浏览器从局域网访问直接 `trim_network error -21`；
+2. 远程 HTTPS 桌面（`https://xxx.fnos.net`）里嵌 HTTP 子帧，浏览器按混合内容拦截；
+3. 旧标签页偶发「FN Connect 暂无权限」，刷新才好。
+
+### 现在的做法
+
+对照 softrouter、kimicode、dsh-fnos 三个项目的做法（见 `docs/FN-CONNECT-OLD-TAB.md`）：
+
+- `ui/config` 改为 `gatewayPrefix: /app/upsbridge` + `gatewaySocket: upsbridge.sock` + `url: /app/upsbridge/`，去掉 protocol/port；
+- 生命周期脚本给主程序传 `--gateway-sock`，服务在 Unix socket 上多监听一个入口；
+- trim_http_cgi 以 root 身份把 `/app/upsbridge/*` 经 socket 转发进来，后端自行剥前缀，同时兼容剥好的裸路径；
+- TCP 28190 保留给内网直连，鉴权规则不变。
+
+桌面 iframe 现在与桌面同源，不再有混合内容问题；服务只在回环监听，端口也不必对局域网开放。
+
+### 权限边界
+
+Unix socket 权限 0600（属主应用用户），只有 root 与应用用户能连；`_allowed()` 对非 tuple 来源（unix socket）直接放行 —— socket 本身就保证只有本机进程可达。
+
+### 验证
+
+| 场景 | 结果 |
+|---|---|
+| Unix socket + 前缀 `GET /app/upsbridge/` | 200 |
+| Unix socket + 前缀 `/api/health`、`/api/status` | 200 |
+| Unix socket + 前缀 POST `/api/config` | 200 |
+| Unix socket + `/log` | 200 |
+| Unix socket 无前缀路径 | 200（兼容剥好的转发） |
+| TCP `127.0.0.1:28190` 直连 | 200（不变） |
+
+`tools/test_lb_guard.py` 9/9 通过。
+
+---
+
 ## upsbridge 1.3.4
 
 换了个图标。

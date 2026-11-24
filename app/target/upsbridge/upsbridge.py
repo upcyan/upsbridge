@@ -5,11 +5,12 @@
 不依赖也不修改 /etc/nut：自己实现 NUT 协议客户端，配置全部在本应用目录里。
 """
 import argparse, hmac, ipaddress, json, os, socket, sys, threading, time, subprocess, re
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.3.4"
+VERSION = "1.4.0"
 
 # 平台感知：Windows 与 Linux 的默认关机命令不同；
 # 容器里可用环境变量 UPSBRIDGE_SHUTDOWN_CMD 覆盖（Docker 版靠它指向宿主机关机）。
@@ -980,6 +981,7 @@ PASSWORD_MASK = "********"
 
 
 PRIV_SOCK = ""          # 由 --priv-sock 传入；空则本进程自己干（root 直跑场景）
+GATEWAY_SOCK = ""       # 由 --gateway-sock 传入；桌面网关经它以同源前缀访问
 PRIV_EXTRA_WAIT = 10
 
 
@@ -1077,6 +1079,15 @@ def is_loopback(addr):
     return ip.is_loopback
 
 
+class UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    request_queue_size = 16
+
+    def get_request(self):
+        req, _addr = super().get_request()
+        return req, ("127.0.0.1", 0)
+
+
 def make_handler(ctx):
     class Handler(BaseHTTPRequestHandler):
         server_version = "upsbridge/" + VERSION
@@ -1109,6 +1120,8 @@ def make_handler(ctx):
             fnOS 桌面网关在本机代理进来，来源恒为回环，所以默认场景无需 token。
             绑 0.0.0.0 给局域网直连时，服务端会要求 token。
             """
+            if not isinstance(self.client_address, tuple):
+                return True  # Unix socket 入口：socket 由本机创建，仅本机进程可达
             if is_loopback(self.client_address[0]):
                 return True
             want = ((ctx.config.get("server") or {}).get("token") or "").strip()
@@ -1122,6 +1135,13 @@ def make_handler(ctx):
             return hmac_compare(got, want)
 
         def do_GET(self):
+            # 桌面网关形态：trim_http_cgi 把 /app/upsbridge/* 转发进来。
+            # 实测它会原样携带前缀（未剥），这里自行剥掉，兼容两种网关行为。
+            for pre in ("/app/upsbridge",):
+                if self.path == pre or self.path == pre + "/":
+                    self.path = "/"
+                elif self.path.startswith(pre + "/"):
+                    self.path = self.path[len(pre):]
             parsed = urlparse(self.path)
             p = parsed.path
             qs = parse_qs(parsed.query)
@@ -1182,6 +1202,11 @@ def make_handler(ctx):
             return self._text("not found", 404, "text/plain")
 
         def do_POST(self):
+            for pre in ("/app/upsbridge",):
+                if self.path == pre or self.path == pre + "/":
+                    self.path = "/"
+                elif self.path.startswith(pre + "/"):
+                    self.path = self.path[len(pre):]
             if not self._allowed():
                 return self._deny()
             p = self.path.split("?")[0]
@@ -2017,6 +2042,8 @@ def main():
     ap.add_argument("--log", default=None)
     ap.add_argument("--priv-sock", default="",
                     help="root 特权助手 socket；给了就把关机与 ping 交给它")
+    ap.add_argument("--gateway-sock", default="",
+                    help="桌面网关 socket；给了就多监听一个同源入口，前缀 /app/upsbridge")
     a = ap.parse_args()
 
     cfg_path = a.config
@@ -2042,6 +2069,8 @@ def main():
 
     global PRIV_SOCK
     PRIV_SOCK = (a.priv_sock or "").strip()
+    global GATEWAY_SOCK
+    GATEWAY_SOCK = (a.gateway_sock or "").strip()
 
     ctx = Ctx()
     ctx.config = cfg
@@ -2085,6 +2114,13 @@ def main():
         ctx.log.add("绑定 %s:%d 失败：%s" % (bind, a.port, e), "error")
         raise
     ctx.log.add("管理界面已启动，监听 %s:%d" % (bind, a.port), "ok")
+    if GATEWAY_SOCK:
+        try:
+            gw = UnixHTTPServer(GATEWAY_SOCK, make_handler(ctx))
+            threading.Thread(target=gw.serve_forever, daemon=True).start()
+            ctx.log.add("桌面网关已就绪：%s（前缀 /app/upsbridge）" % GATEWAY_SOCK, "ok")
+        except OSError as e:
+            ctx.log.add("桌面网关 %s 创建失败：%s（桌面入口将不可用）" % (GATEWAY_SOCK, e), "error")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
