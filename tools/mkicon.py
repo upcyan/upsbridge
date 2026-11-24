@@ -1,41 +1,78 @@
+"""Render the upsbridge icon PNGs from app/ui/images/icon.svg.
 
-import zlib, struct, sys
+The vector source is the single source of truth; this script only rasterises it
+with the system librsvg, so the app icon never drifts from the drawing.
+"""
 
-def png(path, size):
-    # 深色圆角底 + 电池形状，蓝色
-    W=H=size
-    bg=(22,27,35); fg=(76,141,255); fg2=(63,185,80)
-    rows=[]
-    r=max(2, size//8)
-    def rounded(x,y):
-        # 圆角矩形距离判断
-        cx = min(max(x, r), W-1-r); cy = min(max(y, r), H-1-r)
-        return (x-cx)**2 + (y-cy)**2 <= r*r
-    bx0,bx1 = int(W*0.24), int(W*0.72)
-    by0,by1 = int(H*0.34), int(H*0.68)
-    for y in range(H):
-        row=bytearray([0])
-        for x in range(W):
-            if not rounded(x,y):
-                row += bytes((0,0,0,0)); continue
-            c = bg
-            # 电池主体描边
-            if bx0-2 <= x <= bx1+2 and by0-2 <= y <= by1+2:
-                inside = bx0 <= x <= bx1 and by0 <= y <= by1
-                if inside: c = fg
-                else: c = (230,237,243)
-            # 电池正极凸起
-            if int(W*0.72) < x <= int(W*0.78) and int(H*0.44) <= y <= int(H*0.58):
-                c = (230,237,243)
-            row += bytes((c[0],c[1],c[2],255))
-        rows.append(bytes(row))
-    raw=b"".join(rows)
-    def chunk(t,d):
-        return struct.pack(">I",len(d))+t+d+struct.pack(">I", zlib.crc32(t+d)&0xffffffff)
-    out=b"\x89PNG\r\n\x1a\n"
-    out+=chunk(b"IHDR", struct.pack(">IIBBBBB", W,H,8,6,0,0,0))
-    out+=chunk(b"IDAT", zlib.compress(raw,9))
-    out+=chunk(b"IEND", b"")
-    open(path,"wb").write(out)
+import argparse
+import ctypes
+from pathlib import Path
 
-png(sys.argv[1], int(sys.argv[2]))
+
+SIZES = (64, 256)
+
+
+def _load():
+    rsvg = ctypes.CDLL("librsvg-2.so.2")
+    pixbuf = ctypes.CDLL("libgdk_pixbuf-2.0.so.0")
+    rsvg.rsvg_handle_new_from_file.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+    rsvg.rsvg_handle_new_from_file.restype = ctypes.c_void_p
+    rsvg.rsvg_handle_get_pixbuf.argtypes = [ctypes.c_void_p]
+    rsvg.rsvg_handle_get_pixbuf.restype = ctypes.c_void_p
+    pixbuf.gdk_pixbuf_scale_simple.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.c_int, ctypes.c_int]
+    pixbuf.gdk_pixbuf_scale_simple.restype = ctypes.c_void_p
+    pixbuf.gdk_pixbuf_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                       ctypes.c_char_p, ctypes.c_void_p,
+                                       ctypes.c_void_p]
+    return rsvg, pixbuf
+
+
+def render(svg, size):
+    rsvg, pixbuf = _load()
+    handle = rsvg.rsvg_handle_new_from_file(str(svg).encode(), None)
+    if not handle:
+        raise SystemExit("cannot read %s" % svg)
+    base = rsvg.rsvg_handle_get_pixbuf(handle)
+    if not base:
+        raise SystemExit("cannot rasterise %s" % svg)
+    scaled = pixbuf.gdk_pixbuf_scale_simple(base, size, size, 2)  # 2 = BILINEAR
+    if not scaled:
+        raise SystemExit("cannot scale to %dpx" % size)
+    return scaled, pixbuf
+
+
+def write(svg, path, size):
+    scaled, pixbuf = render(svg, size)
+    if not pixbuf.gdk_pixbuf_save(scaled, str(path).encode(), b"png", None, None):
+        raise SystemExit("cannot write %s" % path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="rasterise the app icon")
+    parser.add_argument("path", nargs="?", type=Path)
+    parser.add_argument("size", nargs="?", type=int)
+    args = parser.parse_args()
+
+    app = Path(__file__).resolve().parents[1] / "app"
+    svg = app / "ui" / "images" / "icon.svg"
+    if args.path is not None:
+        if not args.size or args.size < 1:
+            parser.error("path requires a positive size")
+        write(svg, args.path, args.size)
+        return
+
+    desktop = app / "ui" / "images"
+    for size in SIZES:
+        targets = [desktop / ("logo_%d.png" % size)]
+        if size == 64:
+            targets.append(app / "ICON.PNG")
+        else:
+            targets += [app / "ICON_256.PNG", desktop / "logo.png"]
+        for target in targets:
+            write(svg, target, size)
+            print("wrote", target.relative_to(app.parent))
+
+
+if __name__ == "__main__":
+    main()
