@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 
 # 平台感知：Windows 与 Linux 的默认关机命令不同；
 # 容器里可用环境变量 UPSBRIDGE_SHUTDOWN_CMD 覆盖（Docker 版靠它指向宿主机关机）。
