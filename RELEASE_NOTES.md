@@ -1,3 +1,41 @@
+## upsbridge 1.3.3
+
+修一个自己引入的 bug。
+
+### 「测试连接」报 PASSWORD -> ERR INVALID-ARGUMENT
+
+1.3.0 把密码改成「留空表示不修改」时，只改了保存路径 `/api/config`（走 `merge_config`），漏了 `/api/test` —— 它还在用 `deep_merge` 直接合并前端提交的内容。
+
+页面拿不到原密码，密码框回填的是空字符串，于是测试连接把空密码发给了上游。若上游开了认证，`PASSWORD` 命令收到空参数就返回 `ERR INVALID-ARGUMENT`，看起来像连接坏了，其实只是密码被自己清掉了。
+
+现在 `/api/test` 和保存走同一套合并逻辑：留空就沿用已保存的密码。磁盘上本来就没有密码时，才会如实报错。
+
+### 顺带把 NUT 的错误翻成人话
+
+原来失败时直接把 NUT 的原始响应抛给界面：`PASSWORD -> ERR INVALID-ARGUMENT`。这个字符串对排查没帮助 —— 它没说清是「密码为空」还是「密码错误」。
+
+加了一张错误翻译表，覆盖 `INVALID-ARGUMENT` / `ACCESS-DENIED` / `UNKNOWN-UPS` / `USERNAME-REQUIRED` / `ALREADY-LOGGED-IN` 等常见码，并在结尾保留原始命令与错误码，需要深挖时仍有据可查。现在的报错长这样：
+
+```
+密码不能为空：上游开了认证就必须填，留空会被 NUT 直接拒绝（PASSWORD INVALID-ARGUMENT）
+上游拒绝登录：账号或密码不对（LOGIN ACCESS-DENIED）
+```
+
+### 验证
+
+用一个会真正校验账号密码的假 upsd 实测：
+
+| 场景 | 结果 |
+|---|---|
+| 密码框留空、磁盘上已存密码 | 连接成功 |
+| 密码填错 | 上游拒绝登录：账号或密码不对 |
+| 密码正确 | 连接成功 |
+| 磁盘上本来没有密码 | 密码不能为空，并说明原因 |
+
+另外修了 `merge_config` 在 `upstream` 传 `null` 时会把整个段写成 `None` 的边界情况。`tools/test_lb_guard.py` 9/9 通过。
+
+---
+
 ## upsbridge 1.3.2
 
 旁路验证降级成诊断按钮。

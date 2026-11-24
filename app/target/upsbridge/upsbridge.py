@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 
 # 平台感知：Windows 与 Linux 的默认关机命令不同；
 # 容器里可用环境变量 UPSBRIDGE_SHUTDOWN_CMD 覆盖（Docker 版靠它指向宿主机关机）。
@@ -219,6 +219,39 @@ class Log:
             pass
 
 
+NUT_ERROR_HINTS = {
+    ("USERNAME", "INVALID-ARGUMENT"): "用户名不能为空",
+    ("PASSWORD", "INVALID-ARGUMENT"): "密码不能为空：上游开了认证就必须填，"
+                                      "留空会被 NUT 直接拒绝",
+    ("LOGIN", "INVALID-ARGUMENT"): "UPS 名称不能为空",
+    ("LOGIN", "ACCESS-DENIED"): "上游拒绝登录：账号或密码不对",
+    ("USERNAME", "ACCESS-DENIED"): "上游拒绝这个用户名",
+    ("PASSWORD", "ACCESS-DENIED"): "上游拒绝这个密码",
+    ("LOGIN", "UNKNOWN-UPS"): "上游没有这个 UPS 名称",
+    ("LOGIN", "USERNAME-REQUIRED"): "上游要求先登录：请填写账号和密码",
+    ("LOGIN", "PASSWORD-REQUIRED"): "上游要求先登录：请补充密码",
+    ("LOGIN", "ALREADY-LOGGED-IN"): "上游已有别的客户端在用这个账号",
+}
+
+
+def friendly_nut_error(cmd_name, raw):
+    """把 NUT 的 ERR 原文翻成人能看懂的一句话，保留原文便于排查。"""
+    code = raw[3:].strip() if raw.startswith("ERR") else raw
+    code = code.split()[0] if code else ""
+    hint = NUT_ERROR_HINTS.get((cmd_name, code))
+    if not hint:
+        hint = {
+            "ACCESS-DENIED": "上游拒绝访问",
+            "INVALID-ARGUMENT": "上游认为参数不合法",
+            "UNKNOWN-UPS": "上游没有这个 UPS",
+            "USERNAME-REQUIRED": "上游要求先登录",
+            "PASSWORD-REQUIRED": "上游要求先登录",
+            "ALREADY-LOGGED-IN": "上游已有其他客户端登录",
+            "DRIVER-NOT-CONNECTED": "上游的 UPS 驱动没连上",
+        }.get(code, "上游返回了错误")
+    return "%s（%s %s）" % (hint, cmd_name, code)
+
+
 class NutClient:
     """最小可用的 NUT upsd 客户端：登录、拉变量、接 FSD。"""
 
@@ -246,12 +279,13 @@ class NutClient:
 
     def _expect_ok(self, cmd, timeout=5):
         self._send(cmd)
+        name = cmd.split(" ")[0]
         while True:
             resp = self._readline(timeout)
             if resp.startswith("OK"):
                 return True
             if resp.startswith("ERR"):
-                raise RuntimeError(cmd.split(" ")[0] + " -> " + resp)
+                raise RuntimeError(friendly_nut_error(name, resp))
 
     def connect(self, up):
         self.close()
@@ -1023,6 +1057,8 @@ def merge_config(old, patch):
     old_pwd = ((old.get("upstream") or {}).get("password")) or ""
     patch = json.loads(json.dumps(patch or {}))
     up = patch.get("upstream")
+    if up is None:
+        patch.pop("upstream", None)
     if isinstance(up, dict):
         up.pop("password_set", None)
         if not up.get("password"):
@@ -1157,7 +1193,9 @@ def make_handler(ctx):
                 return self._json({"ok": False, "error": "JSON 解析失败"}, 400)
 
             if p == "/api/test":
-                up = deep_merge(ctx.config["upstream"], data.get("upstream") or {})
+                # 和保存走同一套合并：页面拿不到原密码，留空时必须沿用已保存的值，
+                # 否则「测试连接」会拿空密码去登录，得到 ERR INVALID-ARGUMENT。
+                up = merge_config(ctx.config, {"upstream": data.get("upstream") or {}})["upstream"]
                 c = NutClient({}, ctx.log)
                 try:
                     c.connect(up)
