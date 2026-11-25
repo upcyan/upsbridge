@@ -40,20 +40,6 @@ UPS ──USB──> 某台机器（NUT Server，3493/tcp）
 | `witness_host` | 空 | 诊断时的旁路目标，不能填 NUT 服务器自己 |
 | `dry_run` | **true** | 演练模式，只记日志 |
 
-## 踩过的坑
-
-### 假低电量
-
-部分 APC / UGREEN 的 HID 驱动在 `CHRG` 切换时会瞬时把 `LB` 位置起来，表现是市电正常却报 `OL LB`，同时电量还是 100%。1.0.1 及更早的版本见到 `LB` 就关机，曾两次在市电正常的情况下误关机。现在 `LB` 要同时满足：确实在电池供电、电量或续航真的低于阈值、持续 `lb_grace_seconds`。
-
-### 残留的 FSD
-
-NUT 没有清除 FSD 的命令。两道闸：`fsd_grace_seconds` 要求 FSD 持续一段时间；本次运行必须曾观测到 `OB` 才承认它是本次断电的信号。
-
-### 失联不等于断电
-
-NUT 服务器本身就装在那台接了 UPS 的机器上，真断电时它靠电池照样跑，NUT 反而不会断。所以 `stale` 几乎总和断电无关——多是网络或那台 NAS 出了问题。但本机此刻可能正靠电池硬撑，而电量读数也随 NUT 消失了，需要的话设 `shutdown_when_stale_seconds` 兜底。诊断卡片能区分这两种情况，前提是填了一台没接 UPS 的旁路设备（填 NUT 服务器自己会被拒绝）。
-
 ## 权限模型
 
 `cmd/main`（root）起一个只认 `ping` 和 `poweroff` 的白名单助手，前台服务降权到 `upsbridge` 用户运行。助手走 unix socket + `SO_PEERCRED` 校验。缺用户或缺 `setpriv` 时退回 root 直跑，功能不受影响。Web 默认只听 `127.0.0.1`，桌面经 fnOS 网关代理；要局域网直连需设 `server.bind: 0.0.0.0` 和 `server.token`。
