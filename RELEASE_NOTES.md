@@ -1,3 +1,27 @@
+## upsbridge 1.4.1
+
+修 1.4.0 的启动失败。装过 1.4.0 的必须用这一版（fnOS 不允许同版本覆盖）。
+
+### 症状
+
+应用中心弹「无法启用 upsbridge / 本地应用启动失败」，服务没起来。
+
+### 原因
+
+1.4.0 把桌面入口迁到网关形态时，给启动命令加了 `--gateway-sock "$GATEWAY_SOCK"`，但**变量定义那一段没有进包**。生命周期脚本用 `set -u` 跑，`start` 执行到这一行就因未定义变量退出，应用中心判定启动失败。
+
+另外，异常退出会在磁盘留下网关 socket 文件；下次启动时报 `Address already in use`，桌面网关起不来。
+
+### 修复
+
+- `cmd/main` 补上 `GATEWAY_SOCK="$APP_HOME/target/upsbridge.sock"` 定义；
+- `stop` 与 `start` 前都清理网关 socket 文件；
+- 真机验证：restart、status、socket、`/app/upsbridge/` 页面、`/log` 全部正常，二次重启幂等。
+
+已在真机跑通，`tools/test_lb_guard.py` 9/9 通过。
+
+---
+
 ## upsbridge 1.4.0
 
 桌面入口从端口 iframe 迁到同源网关。
