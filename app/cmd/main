@@ -37,6 +37,8 @@ PORT="${UPSBRIDGE_PORT:-28190}"
 APP="$APP_HOME/target/upsbridge/upsbridge.py"
 CONF="$ETC/config.json"
 HELPER_SRC="$APP_HOME/target/upsbridge/privileged.py"
+# 桌面网关 socket：trim_http_cgi 以 root 把 /app/upsbridge/* 经它转发进服务
+GATEWAY_SOCK="$APP_HOME/target/upsbridge.sock"
 # 助手副本只从 root 专属目录运行：应用目录归应用用户，若直接从那儿跑，
 # 任何能改应用目录的人就等于能改一段以 root 执行的脚本。
 PRIV_DIR="$ETC/priv"
@@ -163,7 +165,7 @@ do_start() {
     log "pid $(pid_from_file) 存活但 :$PORT 无响应，先清理"
     do_stop
   fi
-  rm -f "$PIDFILE"
+  rm -f "$PIDFILE" "$GATEWAY_SOCK" 2>/dev/null
   if [ ! -f "$APP" ]; then log "找不到主程序 $APP"; return 1; fi
   [ -f "$CONF" ] || cp "$APP_HOME/target/upsbridge/config.default.json" "$CONF"
 
@@ -235,6 +237,7 @@ do_stop() {
   fi
   # 兜底：pidfile 丢失/失效时按命令行清理残留进程，避免端口被占着起不来
   pkill -f "$APP" 2>/dev/null
+  rm -f "$GATEWAY_SOCK" 2>/dev/null
   rm -f "$PIDFILE"
 
   local hpid; hpid="$(tr -dc '0-9' < "$HELPER_PIDFILE" 2>/dev/null)"
