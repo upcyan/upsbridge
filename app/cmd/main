@@ -173,6 +173,7 @@ do_start() {
   local use_drop=0
   if drop_priv_available; then
     chown -R "$(app_uid):$(app_gid)" "$VAR" "$ETC" 2>/dev/null || true
+    [ -f "$CONF" ] && chown "$(app_uid):$(app_gid)" "$CONF" 2>/dev/null || true
     chmod 750 "$VAR" "$ETC" 2>/dev/null || true
     use_drop=1
   else

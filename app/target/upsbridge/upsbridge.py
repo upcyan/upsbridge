@@ -1437,7 +1437,7 @@ LOG_PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
   <div class="top">
-    <a class="back" href="/">‹ 返回</a>
+    <a class="back" href="./">‹ 返回</a>
     <div class="title">运行日志<small id="verline">UPS 断电联动</small></div>
     <div class="live"><span class="dot" id="liveDot"></span><span id="liveTxt">连接中…</span></div>
   </div>
@@ -1459,7 +1459,7 @@ LOG_PAGE = r"""<!DOCTYPE html>
     <div class="chips" id="chips"></div>
     <div class="acts">
       <button class="btn on" id="btnAuto">自动滚动</button>
-      <a class="btn" href="/api/logs/export" download>导出</a>
+      <a class="btn" href="api/logs/export" download>导出</a>
       <button class="btn danger" id="btnClear">清空</button>
     </div>
   </div>
@@ -1606,7 +1606,7 @@ function merge(d){
 }
 
 function poll(){
-  fetch('/api/logs?seq='+state.lastSeq+'&limit=800')
+  fetch('api/logs?seq='+state.lastSeq+'&limit=800')
     .then(function(r){ return r.json(); })
     .then(function(d){
       q('liveDot').className = 'dot';
@@ -1641,7 +1641,7 @@ function renderStatus(d){
 }
 
 function statusPoll(){
-  fetch('/api/status').then(function(r){ return r.json(); }).then(renderStatus).catch(function(){});
+  fetch('api/status').then(function(r){ return r.json(); }).then(renderStatus).catch(function(){});
 }
 
 q('chips').addEventListener('click', function(ev){
@@ -1693,7 +1693,7 @@ col.addEventListener('scroll', function(){ if (atBottom()) q('btnJump').classLis
 
 q('btnClear').onclick = function(){
   if (!confirm('清空全部运行日志？此操作不可撤销。')) return;
-  fetch('/api/logs/clear', {method:'POST'}).then(function(){
+  fetch('api/logs/clear', {method:'POST'}).then(function(){
     state.entries = []; state.lastSeq = 0; state.sel = null; state.counts = null;
     detail.classList.remove('show');
     poll(); statusPoll();
@@ -1705,7 +1705,7 @@ document.addEventListener('keydown', function(ev){
   else if (ev.key === 'Escape') { q('q').value=''; state.q=''; render(); q('q').blur(); }
 });
 
-fetch('/api/health').then(function(r){ return r.json(); }).then(function(d){
+fetch('api/health').then(function(r){ return r.json(); }).then(function(d){
   q('verline').textContent = 'upsbridge ' + d.version;
 }).catch(function(){});
 statusPoll(); poll();
@@ -1859,7 +1859,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="k">运行日志</div>
       <div class="hint peek" id="logPeek"><span class="pd"></span><span class="pt">—</span></div>
     </div>
-    <a class="btn" href="/log">打开日志页 ›（可搜索 / 筛选 / 导出）</a>
+    <a class="btn" href="log">打开日志页 ›（可搜索 / 筛选 / 导出）</a>
   </div>
 </div>
 <script>
@@ -1887,8 +1887,8 @@ function renderStatus(d){
 }
 
 function tick(){
-  fetch('/api/status').then(function(r){ return r.json(); }).then(renderStatus).catch(function(){});
-  fetch('/api/log?limit=1').then(function(r){ return r.json(); }).then(function(d){
+  fetch('api/status').then(function(r){ return r.json(); }).then(renderStatus).catch(function(){});
+  fetch('api/log?limit=1').then(function(r){ return r.json(); }).then(function(d){
     var e = (d.entries || [])[0];
     var peek = q('logPeek');
     var dot = peek.querySelector('.pd'), txt = peek.querySelector('.pt');
@@ -1939,7 +1939,7 @@ function collect(){
 
 q('btnTest').onclick = function(){
   q('testMsg').textContent = '连接中…'; q('testMsg').style.color = 'var(--dim)';
-  fetch('/api/test', {method:'POST', headers:{'Content-Type':'application/json'},
+  fetch('api/test', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({upstream: collect().upstream})})
   .then(function(r){ return r.json(); })
   .then(function(d){
@@ -1958,11 +1958,11 @@ q('btnDiagnose').onclick = function(){
   btn.disabled = true;
   q('diagMsg').textContent = '诊断中…'; q('diagMsg').style.color = 'var(--dim)';
   // 先把旁路地址写进配置，免得用户填了却没保存就去点诊断
-  var save = fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
+  var save = fetch('api/config', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({rules:{witness_host:q('rule_witness').value.trim()}})})
     .catch(function(){ return null; });
   save.then(function(){
-    return fetch('/api/diagnose', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    return fetch('api/diagnose', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   }).then(function(r){ return r.json(); }).then(function(d){
     if (!d.ok) {
       q('diagMsg').textContent = '诊断失败：' + (d.error || '未知错误');
@@ -1999,7 +1999,7 @@ q('btnDiagnose').onclick = function(){
 
 q('btnNotifyTest').onclick = function(){
   q('testMsg').textContent = '发送中…'; q('testMsg').style.color = 'var(--dim)';
-  fetch('/api/notify/test', {method:'POST', headers:{'Content-Type':'application/json'},
+  fetch('api/notify/test', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(collect())})
   .then(function(r){ return r.json(); })
   .then(function(d){
@@ -2010,22 +2010,22 @@ q('btnNotifyTest').onclick = function(){
 
 q('btnSave').onclick = function(){
   q('saveMsg').textContent = '保存中…';
-  fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
+  fetch('api/config', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(collect())})
   .then(function(r){ return r.json(); }).then(function(d){
     q('saveMsg').textContent = d.ok ? '已保存，规则立即生效' : ('失败：' + d.error);
     q('saveMsg').style.color = d.ok ? 'var(--ok)' : 'var(--bad)';
-    fetch('/api/config').then(function(r){return r.json();}).then(fill);
+    fetch('api/config').then(function(r){return r.json();}).then(fill);
   });
 };
 
 q('btnReset').onclick = function(){
-  fetch('/api/reset_shutdown', {method:'POST'}).then(function(){
+  fetch('api/reset_shutdown', {method:'POST'}).then(function(){
     q('saveMsg').textContent = '已复位'; q('saveMsg').style.color = 'var(--ok)';
   });
 };
 
-fetch('/api/config').then(function(r){ return r.json(); }).then(fill).catch(function(){});
+fetch('api/config').then(function(r){ return r.json(); }).then(fill).catch(function(){});
 tick(); setInterval(tick, 2000);
 </script>
 </body>
